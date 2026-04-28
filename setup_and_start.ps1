@@ -3,16 +3,42 @@
 # Run again with -Reconfigure to update saved settings.
 
 param(
-    [switch]$Reconfigure
+    [switch]$Reconfigure,
+    [switch]$Silent      # set by launch.vbs — suppresses output and skips prompts
 )
 
 $appDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-Write-Host ""
-Write-Host "  ================================================" -ForegroundColor Cyan
-Write-Host "           SNBI Review App" -ForegroundColor Cyan
-Write-Host "  ================================================" -ForegroundColor Cyan
-Write-Host ""
+if (-not $Silent) {
+    Write-Host ""
+    Write-Host "  ================================================" -ForegroundColor Cyan
+    Write-Host "           SNBI Review App" -ForegroundColor Cyan
+    Write-Host "  ================================================" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+# In Silent mode, skip all setup prompts — env vars must already be set
+if ($Silent) {
+    $savedKey     = [Environment]::GetEnvironmentVariable("ANTHROPIC_API_KEY", "User")
+    $savedBridges = [Environment]::GetEnvironmentVariable("SNBI_BRIDGES_ROOT", "User")
+    $env:ANTHROPIC_API_KEY = $savedKey
+    $env:SNBI_BRIDGES_ROOT = $savedBridges
+
+    $pythonCmd = $null
+    foreach ($cmd in @("py", "python", "python3")) {
+        try {
+            $ver = & $cmd --version 2>&1
+            if ($ver -match "Python 3") { $pythonCmd = $cmd; break }
+        } catch {}
+    }
+    if (-not $pythonCmd) { exit 1 }
+
+    Set-Location $appDir
+    # Open browser after 3 seconds (gives the server time to start)
+    Start-Job -ScriptBlock { Start-Sleep 3; Start-Process "http://localhost:5000" } | Out-Null
+    & $pythonCmd app.py --port 5000
+    exit
+}
 
 # -- Step 0: Check for Python ---------------------------------------------
 Write-Host "  Checking for Python..." -ForegroundColor White
@@ -168,4 +194,6 @@ if ($needsSetup) {
 
 # -- Start the app --------------------------------------------------------
 Set-Location $appDir
+Write-Host "  Opening browser..." -ForegroundColor Green
+Start-Job -ScriptBlock { Start-Sleep 3; Start-Process "http://localhost:5000" } | Out-Null
 & $pythonCmd app.py --port 5000
