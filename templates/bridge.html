@@ -1,0 +1,937 @@
+{% extends "base.html" %}
+{% block title %}{{ bridge.bridge_id }} — SNBI Review{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+{% endblock %}
+
+{% block content %}
+
+{# ── Evidence table macro — defined first so it can be called below ── #}
+{% macro evidence_table(rows, show_feature) %}
+{% set ncols = 14 if show_feature else 13 %}
+<table>
+  <thead>
+    <tr>
+      <th style="width:80px">Item</th>
+      {% if show_feature %}<th style="width:62px">Feature</th>{% endif %}
+      <th style="min-width:110px">Name</th>
+      <th style="min-width:70px">BrM</th>
+      <th style="min-width:80px">Plan Value</th>
+      <th style="width:68px">Conf</th>
+      <th style="min-width:120px">AI Recommendation</th>
+      <th style="min-width:160px">Reasoning</th>
+      <th style="min-width:80px">Source</th>
+      <th style="min-width:110px">Determination</th>
+      <th style="min-width:160px">Notes</th>
+      <th style="width:44px;text-align:center" title="Flag for field collection">Field</th>
+      <th style="min-width:110px">Review</th>
+      {% if show_feature %}<th style="width:32px"></th>{% endif %}
+    </tr>
+  </thead>
+  <tbody>
+    {% set ns = namespace(last_feat='') %}
+    {% for row in rows %}
+      {% if show_feature and row.feature_id != ns.last_feat %}
+        {% set ns.last_feat = row.feature_id %}
+        <tr class="feat-group-hdr" data-feature-id="{{ row.feature_id }}" style="background:#f8fafc">
+          <td colspan="{{ ncols - 1 }}" style="padding:5px 12px;font-size:11px;font-weight:700;
+                                   color:#64748b;letter-spacing:.05em;text-transform:uppercase;
+                                   border-bottom:1px solid #e2e8f0">
+            {{ row.feature_id }}
+            {% if row.feature_id.startswith('WORK') %} — Work Record
+            {% elif row.feature_id.startswith('H') %} — Highway
+            {% elif row.feature_id.startswith('W') %} — Waterway
+            {% elif row.feature_id.startswith('R') %} — Railroad
+            {% elif row.feature_id.startswith('P') %} — Pathway
+            {% elif row.feature_id.startswith('F') %} — Relief for Waterway
+            {% elif row.feature_id.startswith('B') %} — Urban Feature
+            {% elif row.feature_id.startswith('D') %} — Dry Terrain / Side Slope
+            {% elif row.feature_id.startswith('X') %} — Other
+            {% endif %}
+          </td>
+          <td style="padding:3px 6px;text-align:right;border-bottom:1px solid #e2e8f0">
+            <button class="del-feat-btn" title="Delete entire {{ row.feature_id }} group"
+                    onclick="deleteFeatureGroup('{{ row.feature_id }}')"
+                    style="background:none;border:none;color:#dc2626;cursor:pointer;
+                           font-size:14px;padding:0 4px;line-height:1;opacity:.5"
+                    onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.5">✕</button>
+          </td>
+        </tr>
+      {% endif %}
+      <tr data-id="{{ row.id }}" data-recommendation="{{ row.ai_recommendation or '' }}">
+        <td><span class="mono" style="font-size:12px;font-weight:600">{{ row.item_id }}</span></td>
+        {% if show_feature %}
+        <td><span style="font-size:11px;color:#64748b">{{ row.feature_id }}</span></td>
+        {% endif %}
+        <td style="font-size:12px">{{ row.item_name or '' }}</td>
+        <td><span class="mono" style="font-size:12px;color:#94a3b8">{{ row.brm_value or '—' }}</span></td>
+        <td><span class="mono" style="font-size:12px;color:#64748b">{{ row.plan_value or '—' }}</span></td>
+        <td><span class="badge badge-{{ row.plan_confidence }}">
+          {%- if row.plan_confidence == 'NOT_FOUND' -%}—{%- else -%}{{ row.plan_confidence }}{%- endif -%}
+        </span></td>
+        <td title="{{ row.lesson_hint or '' }}">
+          {% if row.ai_recommendation %}
+          <span class="mono" style="font-size:12px;font-weight:700;color:#1e293b">
+            {{- row.ai_recommendation -}}
+          </span>
+          <span class="rec-tag rec-{{ row.rec_source }}">
+            {%- if row.rec_source == 'plan-high' %}Plan
+            {%- elif row.rec_source == 'plan-approx' %}~Plan
+            {%- elif row.rec_source == 'brm' %}BrM
+            {%- elif row.rec_source == 'field' %}Field
+            {%- elif row.rec_source == 'na' %}N/A
+            {%- endif -%}
+          </span>
+          {% if row.lesson_hint %}
+          <span style="display:block;font-size:10px;color:#94a3b8;margin-top:2px;
+                       font-style:italic;line-height:1.3;max-width:150px"
+                title="{{ row.lesson_hint }}">💡 Prior feedback</span>
+          {% endif %}
+          {% else %}
+          <span style="color:#cbd5e1;font-size:11px">—</span>
+          {% endif %}
+        </td>
+        <td>
+          <span style="font-size:11px;color:#374151;line-height:1.4;display:block;max-width:180px"
+                title="{{ row.rec_reasoning or '' }}">{{ row.rec_reasoning or '' }}</span>
+        </td>
+        <td>
+          {% if row.plan_source_pages %}
+          <span class="source-text">{{ row.plan_source_pages }}</span>
+          <button class="view-btn"
+                  onclick="viewSource(this.dataset.src)"
+                  data-src="{{ row.plan_source_pages }}">View</button>
+          {% else %}
+          <span style="color:#94a3b8;font-size:11px">—</span>
+          {% endif %}
+        </td>
+        <td class="editable">
+          <input type="text" value="{{ row.user_determination or '' }}"
+                 data-field="user_determination" data-id="{{ row.id }}"
+                 placeholder="Enter value…"
+                 onblur="saveField(this)" onkeydown="if(event.key==='Enter')this.blur()">
+        </td>
+        <td class="editable" style="padding:4px 6px">
+          <textarea data-field="user_notes" data-id="{{ row.id }}"
+                    placeholder="Notes…" rows="2"
+                    onblur="saveField(this)"
+                    style="font-size:11px;min-height:42px;max-height:120px;width:100%">{{ row.user_notes or '' }}</textarea>
+          <div style="display:flex;align-items:center;gap:4px;margin-top:3px;flex-wrap:wrap">
+            <label style="cursor:pointer;font-size:10px;color:#64748b;padding:2px 6px;
+                          background:#f1f5f9;border:1px solid #e2e8f0;border-radius:3px;
+                          white-space:nowrap;user-select:none"
+                   title="Attach a screenshot to this row">
+              + Photo
+              <input type="file" accept="image/*" style="display:none"
+                     onchange="uploadScreenshot({{ row.id }}, this)">
+            </label>
+            <div class="shot-gallery" id="shots-{{ row.id }}"
+                 style="display:flex;gap:3px;flex-wrap:wrap"></div>
+          </div>
+        </td>
+        <td style="text-align:center;vertical-align:middle">
+          <input type="checkbox" data-field="needs_field" data-id="{{ row.id }}"
+                 title="Flag for field collection"
+                 {% if row.needs_field %}checked{% endif %}
+                 onchange="saveCheckbox(this)"
+                 style="width:16px;height:16px;cursor:pointer;accent-color:#f59e0b">
+        </td>
+        <td>
+          <div class="status-btns">
+            <button class="s-btn s-btn-correct" title="AI recommendation is correct"
+                    onclick="setStatus({{ row.id }},this.closest('tr'),'CORRECT')">✓</button>
+            <button class="s-btn s-btn-partial" title="AI recommendation is partially correct"
+                    onclick="setStatus({{ row.id }},this.closest('tr'),'PARTIAL')">~</button>
+            <button class="s-btn s-btn-incorrect" title="AI recommendation is incorrect"
+                    onclick="setStatus({{ row.id }},this.closest('tr'),'INCORRECT')">✗</button>
+          </div>
+          <span class="badge badge-st-{{ row.status }} status-badge" style="margin-top:4px">
+            {{ row.status }}
+          </span>
+        </td>
+        {% if show_feature %}
+        <td style="text-align:center;vertical-align:middle;padding:4px 2px">
+          <button title="Delete this row" onclick="deleteEvidenceRow({{ row.id }}, this)"
+                  style="background:none;border:none;color:#94a3b8;cursor:pointer;
+                         font-size:13px;padding:0 4px;line-height:1"
+                  onmouseover="this.style.color='#dc2626'" onmouseout="this.style.color='#94a3b8'">✕</button>
+        </td>
+        {% endif %}
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+{# ── Page layout ───────────────────────────────────────────── #}
+<div class="bridge-layout"
+     data-bridge-id="{{ bridge.bridge_id }}"
+     data-has-pdf="{{ 'true' if has_pdf else 'false' }}"
+     id="bridge-app">
+
+  <!-- LEFT: Evidence -->
+  <div class="bridge-left">
+
+    <!-- Bridge navigation bar -->
+    <div style="display:flex;align-items:center;gap:.625rem;margin-bottom:.875rem;flex-wrap:wrap">
+      {% if prev_id %}
+      <a href="/bridge/{{ prev_id }}" class="btn btn-ghost btn-sm" title="{{ prev_id }}">← Prev</a>
+      {% else %}
+      <span class="btn btn-ghost btn-sm" style="opacity:.35;cursor:default">← Prev</span>
+      {% endif %}
+
+      <span style="font-size:12px;color:#94a3b8;white-space:nowrap">{{ position }} / {{ total }}</span>
+
+      {% if next_id %}
+      <a href="/bridge/{{ next_id }}" class="btn btn-ghost btn-sm" title="{{ next_id }}">Next →</a>
+      {% else %}
+      <span class="btn btn-ghost btn-sm" style="opacity:.35;cursor:default">Next →</span>
+      {% endif %}
+
+      <div style="display:flex;align-items:center;gap:.375rem;margin-left:.5rem;flex:1;min-width:180px">
+        <input id="bridge-search" list="bridge-list" placeholder="Jump to bridge ID…"
+               style="flex:1;padding:5px 10px;border:1px solid #e2e8f0;border-radius:6px;
+                      font-size:13px;font-family:monospace;min-width:0"
+               onkeydown="if(event.key==='Enter')goBridge()">
+        <datalist id="bridge-list">
+          {% for b in all_bridges %}
+          <option value="{{ b.bridge_id }}">{{ b.bridge_name or '' }}</option>
+          {% endfor %}
+        </datalist>
+        <button class="btn btn-primary btn-sm" onclick="goBridge()">Go</button>
+      </div>
+
+      <a href="/review" class="btn btn-ghost btn-sm" style="margin-left:auto">← Queue</a>
+
+      {% if bridge.processing_status in ('REVIEW_DONE', 'COMPLETE') %}
+      <span class="btn btn-sm" style="background:#dcfce7;color:#15803d;border:1px solid #86efac;cursor:default">
+        ✓ Review Complete
+      </span>
+      {% else %}
+      <button class="btn btn-success btn-sm" onclick="completeReview()">
+        Mark Review Complete
+      </button>
+      {% endif %}
+    </div>
+
+    <!-- Bridge header -->
+    <div class="bridge-header">
+      <div class="bridge-id-badge">{{ bridge.bridge_id }}</div>
+      <div class="meta-grid">
+        {% if bridge.bridge_name %}
+        <div class="meta-item"><span class="meta-lbl">Name</span><span class="meta-val">{{ bridge.bridge_name }}</span></div>
+        {% endif %}
+        {% if bridge.county %}
+        <div class="meta-item"><span class="meta-lbl">County</span><span class="meta-val">{{ bridge.county }}</span></div>
+        {% endif %}
+        {% if bridge.year_built %}
+        <div class="meta-item"><span class="meta-lbl">Year Built</span><span class="meta-val">{{ bridge.year_built }}</span></div>
+        {% endif %}
+        {% if bridge.struct_type %}
+        <div class="meta-item"><span class="meta-lbl">Structure Type</span><span class="meta-val">{{ bridge.struct_type }}</span></div>
+        {% endif %}
+        {% if bridge.feature_category %}
+        <div class="meta-item"><span class="meta-lbl">Feature</span><span class="meta-val">{{ bridge.feature_category }}</span></div>
+        {% endif %}
+        <div class="meta-item"><span class="meta-lbl">Status</span><span class="meta-val">{{ bridge.processing_status }}</span></div>
+        {% if bridge.lat and bridge.lon %}
+        <div class="meta-item">
+          <span class="meta-lbl">Location</span>
+          <a class="meta-val"
+             href="https://maps.google.com/maps?q={{ bridge.lat }},{{ bridge.lon }}&t=k&z=18"
+             target="_blank" rel="noopener"
+             style="color:#2563eb;text-decoration:none;font-size:13px">
+            ↗ Satellite Map
+          </a>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- PRIMARY table -->
+    {% if primary_rows %}
+    <div style="margin-bottom:1.25rem">
+      <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
+                  color:#1d4ed8;margin-bottom:.5rem;display:flex;align-items:center;gap:.5rem">
+        <span style="background:#dbeafe;padding:2px 10px;border-radius:4px">Primary Items</span>
+        <span style="color:#94a3b8;font-weight:400;font-size:11px">{{ primary_rows|length }} items</span>
+      </div>
+      <div class="table-wrap"><div class="table-scroll">
+        {{ evidence_table(primary_rows, false) }}
+      </div></div>
+    </div>
+    {% endif %}
+
+    <!-- FEATURES table -->
+    <div style="margin-bottom:1.25rem">
+      <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
+                  color:#15803d;margin-bottom:.5rem;display:flex;align-items:center;gap:.5rem">
+        <span style="background:#dcfce7;padding:2px 10px;border-radius:4px">Feature Items</span>
+        {% if feature_rows %}<span style="color:#94a3b8;font-weight:400;font-size:11px">{{ feature_rows|length }} items</span>{% endif %}
+        <button class="btn btn-ghost btn-sm" onclick="openAddFeatureModal()"
+                style="margin-left:auto;font-size:12px">+ Add Feature</button>
+      </div>
+      {% if feature_rows %}
+      <div class="table-wrap"><div class="table-scroll">
+        {{ evidence_table(feature_rows, true) }}
+      </div></div>
+      {% else %}
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:1rem;
+                  color:#94a3b8;font-size:13px;text-align:center">
+        No feature items yet — click "+ Add Feature" to add one.
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- WORK table -->
+    <div style="margin-bottom:1.25rem">
+      <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;
+                  color:#b45309;margin-bottom:.5rem;display:flex;align-items:center;gap:.5rem">
+        <span style="background:#fef9c3;padding:2px 10px;border-radius:4px">Work Items</span>
+        {% if work_rows %}<span style="color:#94a3b8;font-weight:400;font-size:11px">{{ work_rows|length }} items</span>{% endif %}
+        <button class="btn btn-ghost btn-sm" onclick="openAddWorkModal()"
+                style="margin-left:auto;font-size:12px">+ Add Work Record</button>
+      </div>
+      {% if work_rows %}
+      <div class="table-wrap"><div class="table-scroll">
+        {{ evidence_table(work_rows, true) }}
+      </div></div>
+      {% else %}
+      <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:1rem;
+                  color:#94a3b8;font-size:13px;text-align:center">
+        No work records yet — click "+ Add Work Record" to add one.
+      </div>
+      {% endif %}
+    </div>
+
+    {% if not primary_rows and not feature_rows and not work_rows %}
+    <div class="card" style="text-align:center;padding:2rem;color:#94a3b8">
+      No evidence rows found. Run Phase 1 first.
+    </div>
+    {% endif %}
+
+  </div><!-- /bridge-left -->
+
+  <!-- Add Feature Modal -->
+  <div id="add-feat-modal" style="display:none;position:fixed;inset:0;z-index:500;
+       background:rgba(0,0,0,.45);align-items:center;justify-content:center">
+    <div style="background:#fff;border-radius:10px;padding:1.5rem;min-width:320px;
+                max-width:420px;box-shadow:0 8px 32px rgba(0,0,0,.25)">
+      <div style="font-size:15px;font-weight:700;margin-bottom:1rem">Add Feature</div>
+      <div style="display:flex;flex-direction:column;gap:.875rem">
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#475569;display:block;margin-bottom:4px">Feature Type</label>
+          <select id="feat-type" style="width:100%;padding:7px 10px;border:1px solid #e2e8f0;
+                  border-radius:6px;font-size:13px;background:#fff">
+            <option value="H">H — Highway</option>
+            <option value="R">R — Railroad</option>
+            <option value="P">P — Pathway</option>
+            <option value="W">W — Waterway</option>
+            <option value="F">F — Relief for Waterway</option>
+            <option value="B">B — Urban Feature</option>
+            <option value="D">D — Dry Terrain / Side Slope</option>
+            <option value="X">X — Other</option>
+          </select>
+        </div>
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#475569;display:block;margin-bottom:4px">Feature Number</label>
+          <input id="feat-num" type="number" min="1" max="99" value="1"
+                 style="width:100%;padding:7px 10px;border:1px solid #e2e8f0;
+                        border-radius:6px;font-size:13px">
+          <div style="font-size:11px;color:#94a3b8;margin-top:3px">
+            e.g. type=H, number=1 → feature ID = H01
+          </div>
+        </div>
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#475569;display:block;margin-bottom:4px">Location</label>
+          <select id="feat-location" style="width:100%;padding:7px 10px;border:1px solid #e2e8f0;
+                  border-radius:6px;font-size:13px;background:#fff">
+            <option value="B">B — Below bridge</option>
+            <option value="C">C — Carried on bridge</option>
+            <option value="A">A — Above bridge</option>
+          </select>
+        </div>
+        <div id="feat-error" style="color:#dc2626;font-size:12px;display:none"></div>
+      </div>
+      <div style="display:flex;gap:.5rem;justify-content:flex-end;margin-top:1.25rem">
+        <button class="btn btn-ghost btn-sm" onclick="closeAddFeatureModal()">Cancel</button>
+        <button class="btn btn-success btn-sm" onclick="submitAddFeature()">Add Feature</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Work Record Modal -->
+  <div id="add-work-modal" style="display:none;position:fixed;inset:0;z-index:500;
+       background:rgba(0,0,0,.45);align-items:center;justify-content:center">
+    <div style="background:#fff;border-radius:10px;padding:1.5rem;min-width:320px;
+                max-width:420px;box-shadow:0 8px 32px rgba(0,0,0,.25)">
+      <div style="font-size:15px;font-weight:700;margin-bottom:1rem">Add Work Record</div>
+      <div style="display:flex;flex-direction:column;gap:.875rem">
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#475569;display:block;margin-bottom:4px">Year Work Performed</label>
+          <input id="work-year" type="number" min="1800" max="2100"
+                 placeholder="e.g. 1987"
+                 style="width:100%;padding:7px 10px;border:1px solid #e2e8f0;
+                        border-radius:6px;font-size:13px">
+          <div style="font-size:11px;color:#94a3b8;margin-top:3px">
+            Creates a WORK:YYYY record with rows for year and work codes.
+          </div>
+        </div>
+        <div id="work-error" style="color:#dc2626;font-size:12px;display:none"></div>
+      </div>
+      <div style="display:flex;gap:.5rem;justify-content:flex-end;margin-top:1.25rem">
+        <button class="btn btn-ghost btn-sm" onclick="closeAddWorkModal()">Cancel</button>
+        <button class="btn btn-sm" onclick="submitAddWork()"
+                style="background:#b45309;color:#fff">Add Work Record</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="pdf-resize-handle" class="pdf-resize-handle"></div>
+
+  <!-- RIGHT: PDF / Map viewer -->
+  <div class="bridge-right" id="bridge-right">
+    <div class="pdf-toolbar">
+      <div style="display:flex;gap:2px;flex-shrink:0">
+        <button class="panel-tab active" id="tab-pdf" onclick="showTab('pdf')">PDF</button>
+        <button class="panel-tab" id="tab-map" onclick="showTab('map')">Map</button>
+      </div>
+      <span class="pdf-title" id="pdf-source-label" style="margin-left:.5rem">Plans PDF</span>
+      <div id="zoom-controls" style="display:flex;align-items:center;gap:4px;flex-shrink:0">
+        <button class="zoom-btn" onclick="setZoom(zoom-25)" title="Zoom out">−</button>
+        <span class="zoom-pct" id="zoom-pct">100%</span>
+        <button class="zoom-btn" onclick="setZoom(zoom+25)" title="Zoom in">+</button>
+        <button class="zoom-btn" onclick="setZoom(100)" title="Reset zoom" style="font-size:11px;padding:2px 7px">↺</button>
+      </div>
+    </div>
+
+    <div class="pdf-body" id="pdf-body">
+      <div class="pdf-placeholder" id="pdf-placeholder">
+        {% if has_pdf %}Loading…{% else %}No PDF found for this bridge.{% endif %}
+      </div>
+      <img id="pdf-img" class="pdf-img" style="display:none" alt="PDF page">
+    </div>
+    <div class="pdf-nav" id="pdf-nav">
+      <button id="prev-btn" onclick="prevPage()" disabled>← Prev</button>
+      <div class="pdf-nav-center">
+        <span class="pdf-page-info" id="page-info">— / —</span>
+      </div>
+      <div class="pdf-jump">
+        <label for="jump-input">Page</label>
+        <input id="jump-input" type="number" min="1" value="1"
+               onkeydown="if(event.key==='Enter')jumpTo(this.value)">
+        <button onclick="jumpTo(document.getElementById('jump-input').value)">Go</button>
+      </div>
+      <button id="next-btn" onclick="nextPage()" disabled>Next →</button>
+    </div>
+
+    <div id="map-body" style="flex:1;display:none;min-height:0;position:relative">
+      <div id="map-view" style="width:100%;height:100%"></div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const BRIDGE  = document.getElementById('bridge-app').dataset.bridgeId;
+const HAS_PDF = document.getElementById('bridge-app').dataset.hasPdf === 'true';
+let curPage = 0, totalPages = 0;
+
+// ── Bridge navigation ────────────────────────────────────────
+function goBridge() {
+  const val = document.getElementById('bridge-search').value.trim().toUpperCase();
+  if (val) window.location.href = `/bridge/${val}`;
+}
+document.getElementById('bridge-search').addEventListener('change', function() {
+  const val = this.value.trim().toUpperCase();
+  if (val) window.location.href = `/bridge/${val}`;
+});
+
+// ── PDF pages ────────────────────────────────────────────────
+async function initPDF() {
+  if (!HAS_PDF) return;
+  const info = await fetch(`/api/pdf-info/${encodeURIComponent(BRIDGE)}`).then(r => r.json());
+  totalPages = info.pages || 0;
+  if (totalPages > 0) loadPage(0);
+  else document.getElementById('pdf-placeholder').textContent = 'PDF found but could not be read.';
+}
+function loadPage(idx) {
+  if (idx < 0 || idx >= totalPages) return;
+  curPage = idx;
+  const img = document.getElementById('pdf-img');
+  const ph  = document.getElementById('pdf-placeholder');
+  img.style.display = 'none';
+  ph.textContent    = 'Loading…';
+  ph.style.display  = 'block';
+  img.onload  = () => { ph.style.display = 'none'; img.style.display = 'block'; applyZoom(); refreshNav(); };
+  img.onerror = () => { ph.textContent = 'Failed to load page.'; };
+  img.src = `/api/pdf-page?bridge_id=${encodeURIComponent(BRIDGE)}&page=${idx}&_=${Date.now()}`;
+  document.getElementById('jump-input').value = idx + 1;
+  refreshNav();
+}
+function refreshNav() {
+  document.getElementById('page-info').textContent = `${curPage + 1} / ${totalPages}`;
+  document.getElementById('prev-btn').disabled      = curPage === 0;
+  document.getElementById('next-btn').disabled      = curPage >= totalPages - 1;
+}
+function prevPage() { loadPage(curPage - 1); }
+function nextPage() { loadPage(curPage + 1); }
+function jumpTo(val) {
+  const p = parseInt(val, 10);
+  if (!isNaN(p)) loadPage(Math.min(Math.max(p - 1, 0), totalPages - 1));
+}
+function viewSource(sourceText) {
+  document.getElementById('pdf-source-label').textContent = sourceText || 'Plans PDF';
+  const m = sourceText && sourceText.match(/\d+/);
+  loadPage(Math.min(m ? Math.max(parseInt(m[0], 10) - 1, 0) : 0, totalPages - 1));
+  document.getElementById('pdf-body').scrollTop = 0;
+}
+
+// ── Zoom ─────────────────────────────────────────────────────
+let zoom = 100;
+function applyZoom() {
+  const img = document.getElementById('pdf-img');
+  const body = document.getElementById('pdf-body');
+  const pct = zoom / 100;
+  img.style.width = (body.clientWidth * pct) + 'px';
+}
+function setZoom(z) {
+  zoom = Math.min(Math.max(Math.round(z), 25), 500);
+  document.getElementById('zoom-pct').textContent = zoom + '%';
+  applyZoom();
+}
+// Ctrl+scroll to zoom, plain scroll to navigate pages
+document.getElementById('pdf-body').addEventListener('wheel', function(e) {
+  if (e.ctrlKey) {
+    e.preventDefault();
+    setZoom(zoom + (e.deltaY < 0 ? 15 : -15));
+  }
+}, { passive: false });
+
+// ── Resize handle ─────────────────────────────────────────────
+(function() {
+  const handle = document.getElementById('pdf-resize-handle');
+  const right  = document.getElementById('bridge-right');
+  let dragging = false, startX = 0, startW = 0;
+
+  handle.addEventListener('mousedown', function(e) {
+    dragging = true;
+    startX   = e.clientX;
+    startW   = right.offsetWidth;
+    handle.classList.add('dragging');
+    document.body.style.cursor      = 'col-resize';
+    document.body.style.userSelect  = 'none';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e) {
+    if (!dragging) return;
+    const delta   = startX - e.clientX;
+    const newWidth = Math.min(Math.max(startW + delta, 280), window.innerWidth * 0.8);
+    right.style.width    = newWidth + 'px';
+    right.style.minWidth = newWidth + 'px';
+    applyZoom();
+  });
+  document.addEventListener('mouseup', function() {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    document.body.style.cursor     = '';
+    document.body.style.userSelect = '';
+  });
+})();
+
+// ── Mark review complete ──────────────────────────────────────
+async function completeReview() {
+  if (!confirm('Mark this bridge review as complete?\n\nThis will flag it as ready to send feedback to the AI.')) return;
+  const res = await api(`/api/bridge/${BRIDGE}/complete-review`, {});
+  if (res.ok) {
+    toast('Review marked complete');
+    const btn = document.querySelector('[onclick="completeReview()"]');
+    if (btn) {
+      btn.outerHTML = '<span class="btn btn-sm" style="background:#dcfce7;color:#15803d;border:1px solid #86efac;cursor:default">✓ Review Complete</span>';
+    }
+  } else {
+    toast('Error', 'err');
+  }
+}
+
+// ── Evidence row actions ──────────────────────────────────────
+async function saveField(el) {
+  const res = await api(`/api/evidence/${el.dataset.id}`, { [el.dataset.field]: el.value });
+  if (!res.ok) toast('Save failed', 'err');
+}
+async function saveCheckbox(el) {
+  const res = await api(`/api/evidence/${el.dataset.id}`, { needs_field: el.checked ? 1 : 0 });
+  if (!res.ok) { toast('Save failed', 'err'); el.checked = !el.checked; }
+}
+async function setStatus(id, tr, status) {
+  // Auto-fill Determination with AI recommendation when marking Correct
+  if (status === 'CORRECT') {
+    const det = tr.querySelector('[data-field="user_determination"]');
+    const rec = tr.dataset.recommendation;
+    if (det && !det.value.trim() && rec) {
+      det.value = rec;
+      await saveField(det);
+    }
+  }
+  const res = await api(`/api/evidence/${id}`, { status });
+  if (res.ok) {
+    const b = tr.querySelector('.status-badge');
+    if (b) { b.className = `badge badge-st-${status} status-badge`; b.textContent = status; }
+    const labels = { CORRECT: 'Correct', PARTIAL: 'Partial', INCORRECT: 'Incorrect' };
+    toast(labels[status] || status);
+  } else { toast('Error', 'err'); }
+}
+
+initPDF();
+
+// ── Tab switching ─────────────────────────────────────────────
+function showTab(tab) {
+  const isPdf = tab === 'pdf';
+  document.getElementById('pdf-body').style.display        = isPdf ? 'flex' : 'none';
+  document.getElementById('pdf-nav').style.display         = isPdf ? 'flex' : 'none';
+  document.getElementById('zoom-controls').style.display   = isPdf ? 'flex' : 'none';
+  document.getElementById('pdf-source-label').style.display = isPdf ? 'block' : 'none';
+  document.getElementById('map-body').style.display        = isPdf ? 'none'  : 'flex';
+  document.getElementById('tab-pdf').classList.toggle('active',  isPdf);
+  document.getElementById('tab-map').classList.toggle('active', !isPdf);
+  if (!isPdf) {
+    if (!_mapReady) initMap();
+    else setTimeout(() => _leafletMap && _leafletMap.invalidateSize(), 50);
+  }
+}
+
+// ── Leaflet map ───────────────────────────────────────────────
+const BRIDGE_LAT = {{ bridge.lat  | tojson }};
+const BRIDGE_LON = {{ bridge.lon  | tojson }};
+let _mapReady = false, _leafletMap = null;
+
+function initMap() {
+  _mapReady = true;
+  const el = document.getElementById('map-view');
+
+  if (!BRIDGE_LAT || !BRIDGE_LON) {
+    el.style.cssText = 'display:flex;align-items:center;justify-content:center;height:100%;color:#64748b;font-size:13px';
+    el.textContent = 'No coordinates available for this bridge. Run 06_import_grid.py first.';
+    return;
+  }
+
+  const script = document.createElement('script');
+  script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+  script.onload = () => _buildMap(el);
+  document.head.appendChild(script);
+}
+
+function _buildMap(el) {
+  _leafletMap = L.map(el, {zoomControl: true}).setView([BRIDGE_LAT, BRIDGE_LON], 16);
+
+  const satellite = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    {attribution: 'Tiles © Esri', maxZoom: 20}
+  );
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    {attribution: '© OpenStreetMap contributors', maxZoom: 20}
+  );
+  satellite.addTo(_leafletMap);
+  L.control.layers({'Satellite': satellite, 'Street Map': osm}, {}, {position:'topright'}).addTo(_leafletMap);
+
+  // Bridge marker
+  const pin = L.divIcon({
+    html: '<div style="width:14px;height:14px;background:#ef4444;border:2px solid #fff;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,.6)"></div>',
+    iconSize: [14,14], iconAnchor: [7,7], className: ''
+  });
+  L.marker([BRIDGE_LAT, BRIDGE_LON], {icon: pin, zIndexOffset: 1000})
+   .bindPopup(`<b>{{ bridge.bridge_id }}</b><br>{{ (bridge.bridge_name or '')|e }}`)
+   .addTo(_leafletMap).openPopup();
+
+  _loadOSMFeatures();
+}
+
+async function _loadOSMFeatures() {
+  const r = 300;
+  const q = `[out:json][timeout:15];(
+    way["highway"~"motorway|trunk|primary|secondary|motorway_link|trunk_link|primary_link|secondary_link"](around:${r},${BRIDGE_LAT},${BRIDGE_LON});
+    way["highway"]["name"](around:${r},${BRIDGE_LAT},${BRIDGE_LON});
+    way["waterway"]["name"](around:${r},${BRIDGE_LAT},${BRIDGE_LON});
+    way["railway"](around:${r},${BRIDGE_LAT},${BRIDGE_LON});
+  );out geom tags;`;
+  try {
+    const resp = await fetch('https://overpass-api.de/api/interpreter',
+      {method:'POST', body:'data=' + encodeURIComponent(q)});
+    const data = await resp.json();
+    _drawOSMFeatures(data);
+  } catch(e) {
+    console.warn('OSM feature load failed:', e);
+  }
+  // Also load ODOT bridge inventory markers
+  _loadODOTBridges();
+}
+
+function _drawOSMFeatures(data) {
+  const cfg = {
+    highway:  {color:'#60a5fa', weight:3,   label:'Roads (OSM)'},
+    waterway: {color:'#22d3ee', weight:2.5,  label:'Waterways (OSM)'},
+    railway:  {color:'#fbbf24', weight:3,   label:'Railways (OSM)', dashArray:'6 4'},
+  };
+  const groups = {highway: L.layerGroup(), waterway: L.layerGroup(), railway: L.layerGroup()};
+
+  data.elements.forEach(elem => {
+    if (!elem.geometry || elem.geometry.length < 2) return;
+    const tags   = elem.tags || {};
+    const type   = tags.highway ? 'highway' : tags.waterway ? 'waterway' : tags.railway ? 'railway' : null;
+    if (!type) return;
+    const coords = elem.geometry.map(p => [p.lat, p.lon]);
+    const name   = tags.name || tags.ref || tags.operator || '';
+    const c      = cfg[type];
+    const line   = L.polyline(coords, {color:c.color, weight:c.weight, opacity:.9, dashArray:c.dashArray||null});
+    if (name) line.bindTooltip(name, {sticky:true, className:'osm-tip', direction:'top'});
+    line.addTo(groups[type]);
+  });
+
+  const overlayLabels = {};
+  Object.entries(groups).forEach(([type, group]) => {
+    group.addTo(_leafletMap);
+    overlayLabels[cfg[type].label] = group;
+  });
+
+  // Store so ODOT layer can be added to the same control
+  _leafletMap._osmOverlays = overlayLabels;
+  _leafletMap._osmControl  = L.control.layers(null, overlayLabels, {position:'topright', collapsed:false}).addTo(_leafletMap);
+}
+
+async function _loadODOTBridges() {
+  const odotUrl = 'https://gis.odot.state.or.us/arcgis1006/rest/services/transgis/catalog/MapServer/101/query';
+  const params  = new URLSearchParams({
+    geometry:       `${BRIDGE_LON},${BRIDGE_LAT}`,
+    geometryType:   'esriGeometryPoint',
+    inSR:           '4326',
+    distance:       '500',
+    units:          'esriSRUnit_Meter',
+    outFields:      'BRIDGE_ID,BRIDGE_NAM,CARRIES,CROSSES,YEAR,BRIDGE_CON,LAT,LONG',
+    returnGeometry: 'false',
+    f:              'json',
+  });
+  try {
+    const resp = await fetch(`${odotUrl}?${params}`);
+    const data = await resp.json();
+    _drawODOTBridges(data.features || []);
+  } catch(e) {
+    console.warn('ODOT bridge load failed:', e);
+  }
+}
+
+function _drawODOTBridges(features) {
+  if (!features.length) return;
+  const group = L.layerGroup();
+
+  features.forEach(feat => {
+    const a    = feat.attributes || {};
+    const lat  = parseFloat(a.LAT);
+    const lon  = parseFloat(a.LONG);
+    if (!lat || !lon) return;
+
+    const isThis = a.BRIDGE_ID === BRIDGE.replace(/\D/g,'') ||
+                   (Math.abs(lat - BRIDGE_LAT) < 0.0002 && Math.abs(lon - BRIDGE_LON) < 0.0002);
+    const color  = isThis ? '#ef4444' : '#f97316';
+    const size   = isThis ? 12 : 9;
+
+    const icon = L.divIcon({
+      html: `<div style="width:${size}px;height:${size}px;background:${color};border:2px solid #fff;
+             border-radius:3px;box-shadow:0 1px 4px rgba(0,0,0,.5);transform:rotate(45deg)"></div>`,
+      iconSize: [size, size], iconAnchor: [size/2, size/2], className: ''
+    });
+
+    const lines = [`<b>ODOT #${a.BRIDGE_ID}</b>`];
+    if (a.BRIDGE_NAM) lines.push(a.BRIDGE_NAM);
+    if (a.CARRIES)    lines.push(`Carries: ${a.CARRIES}`);
+    if (a.CROSSES)    lines.push(`Crosses: ${a.CROSSES}`);
+    if (a.YEAR)       lines.push(`Built: ${a.YEAR}`);
+    if (a.BRIDGE_CON) lines.push(`Condition: ${a.BRIDGE_CON}`);
+
+    L.marker([lat, lon], {icon}).bindPopup(lines.join('<br>')).addTo(group);
+  });
+
+  group.addTo(_leafletMap);
+
+  // Add to existing layer control if it exists, otherwise create new one
+  if (_leafletMap._osmControl) {
+    _leafletMap._osmControl.addOverlay(group, 'ODOT Bridges');
+  } else {
+    L.control.layers(null, {'ODOT Bridges': group}, {position:'topright', collapsed:false}).addTo(_leafletMap);
+  }
+}
+
+// ── Delete feature group ──────────────────────────────────────
+async function deleteFeatureGroup(featureId) {
+  if (!confirm(`Delete ALL rows for feature ${featureId}?\n\nThis cannot be undone.`)) return;
+  const res = await fetch(`/api/feature/${encodeURIComponent(BRIDGE)}/${encodeURIComponent(featureId)}`, {method: 'DELETE'});
+  const data = await res.json();
+  if (data.ok) {
+    toast(`Deleted ${featureId}`);
+    setTimeout(() => window.location.reload(), 700);
+  } else {
+    toast('Delete failed', 'err');
+  }
+}
+
+// ── Delete single evidence row ────────────────────────────────
+async function deleteEvidenceRow(id, btn) {
+  if (!confirm('Delete this evidence row?')) return;
+  const res  = await fetch(`/api/evidence/${id}`, {method: 'DELETE'});
+  const data = await res.json();
+  if (data.ok) {
+    const tr = btn.closest('tr');
+    tr.style.transition = 'opacity .2s';
+    tr.style.opacity = '0';
+    setTimeout(() => tr.remove(), 220);
+    toast('Row deleted');
+  } else {
+    toast('Delete failed', 'err');
+  }
+}
+
+// ── Add Feature modal ─────────────────────────────────────────
+function openAddFeatureModal() {
+  const modal = document.getElementById('add-feat-modal');
+  modal.style.display = 'flex';
+  document.getElementById('feat-error').style.display = 'none';
+  document.getElementById('feat-num').value = '1';
+}
+function closeAddFeatureModal() {
+  document.getElementById('add-feat-modal').style.display = 'none';
+}
+async function submitAddFeature() {
+  const type     = document.getElementById('feat-type').value;
+  const num      = parseInt(document.getElementById('feat-num').value, 10);
+  const location = document.getElementById('feat-location').value;
+  const errEl    = document.getElementById('feat-error');
+  if (!num || num < 1) { errEl.textContent = 'Enter a valid feature number.'; errEl.style.display = 'block'; return; }
+  errEl.style.display = 'none';
+  const res  = await fetch(`/api/bridge/${encodeURIComponent(BRIDGE)}/add-feature`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({feature_type: type, feature_num: num, location})
+  });
+  const data = await res.json();
+  if (data.ok) {
+    toast(`Added ${data.feature_id}`);
+    closeAddFeatureModal();
+    setTimeout(() => window.location.reload(), 700);
+  } else {
+    errEl.textContent = data.error || 'Failed to add feature.';
+    errEl.style.display = 'block';
+  }
+}
+// Close modal on backdrop click
+document.getElementById('add-feat-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeAddFeatureModal();
+});
+
+// ── Add Work Record modal ─────────────────────────────────
+function openAddWorkModal() {
+  const modal = document.getElementById('add-work-modal');
+  modal.style.display = 'flex';
+  document.getElementById('work-error').style.display = 'none';
+  document.getElementById('work-year').value = '';
+  document.getElementById('work-year').focus();
+}
+function closeAddWorkModal() {
+  document.getElementById('add-work-modal').style.display = 'none';
+}
+async function submitAddWork() {
+  const year  = document.getElementById('work-year').value.trim();
+  const errEl = document.getElementById('work-error');
+  if (!year || isNaN(year) || year < 1800 || year > 2100) {
+    errEl.textContent = 'Enter a valid 4-digit year.';
+    errEl.style.display = 'block';
+    return;
+  }
+  errEl.style.display = 'none';
+  const res  = await fetch(`/api/bridge/${encodeURIComponent(BRIDGE)}/add-work`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({year: parseInt(year)})
+  });
+  const data = await res.json();
+  if (data.ok) {
+    toast(`Added WORK:${year}`);
+    closeAddWorkModal();
+    setTimeout(() => window.location.reload(), 700);
+  } else {
+    errEl.textContent = data.error || 'Failed to add work record.';
+    errEl.style.display = 'block';
+  }
+}
+document.getElementById('add-work-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeAddWorkModal();
+});
+document.getElementById('work-year').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') submitAddWork();
+});
+
+// ── Screenshots ───────────────────────────────────────────────
+async function uploadScreenshot(evidenceId, input) {
+  const file = input.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  const res  = await fetch(`/api/evidence/${evidenceId}/screenshot`, {method:'POST', body: form});
+  const data = await res.json();
+  if (data.ok) {
+    addShotThumb(evidenceId, data);
+    toast('Screenshot saved');
+  } else {
+    toast(data.error || 'Upload failed', 'err');
+  }
+  input.value = '';
+}
+
+function addShotThumb(evidenceId, shot) {
+  const gallery = document.getElementById(`shots-${evidenceId}`);
+  if (!gallery) return;
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:relative;display:inline-block';
+  wrap.dataset.shotId = shot.id;
+
+  const img = document.createElement('img');
+  img.src = `/api/screenshot/${shot.id}`;
+  img.style.cssText = 'width:40px;height:40px;object-fit:cover;border-radius:3px;cursor:pointer;border:1px solid #e2e8f0;display:block';
+  img.title = shot.caption || 'Click to view full size';
+  img.onclick = () => window.open(`/api/screenshot/${shot.id}`, '_blank');
+
+  const del = document.createElement('button');
+  del.textContent = '×';
+  del.title = 'Delete screenshot';
+  del.style.cssText = 'position:absolute;top:-5px;right:-5px;width:16px;height:16px;' +
+    'border-radius:50%;background:#dc2626;color:#fff;border:none;font-size:10px;' +
+    'line-height:1;cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center';
+  del.onclick = async (e) => {
+    e.stopPropagation();
+    if (!confirm('Delete this screenshot?')) return;
+    const r = await fetch(`/api/screenshot/${shot.id}`, {method:'DELETE'});
+    if ((await r.json()).ok) wrap.remove();
+  };
+
+  wrap.appendChild(img);
+  wrap.appendChild(del);
+  gallery.appendChild(wrap);
+}
+
+// Load existing screenshots for all evidence rows on page load
+(async function loadAllScreenshots() {
+  const ids = new Set();
+  document.querySelectorAll('tr[data-id]').forEach(tr => {
+    if (tr.dataset.id) ids.add(tr.dataset.id);
+  });
+  for (const id of ids) {
+    try {
+      const res  = await fetch(`/api/evidence/${id}/screenshots`);
+      const data = await res.json();
+      (data.screenshots || []).forEach(s => addShotThumb(id, s));
+    } catch (_) {}
+  }
+})();
+</script>
+{% endblock %}

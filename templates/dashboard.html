@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — SNBI Review{% endblock %}
+{% block content %}
+<div class="page">
+
+  <h1 style="margin:0 0 1.25rem;font-size:1.4rem;font-weight:700">Overview</h1>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Total Bridges</div>
+      <div class="card-value">{{ total_bridges }}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Evidence Rows</div>
+      <div class="card-value">{{ "{:,}".format(total_evidence) }}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Pending Review</div>
+      <div class="card-value c-amber">{{ "{:,}".format(pending_review) }}</div>
+      <div class="card-sub">HIGH / APPROX not yet reviewed</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Flagged</div>
+      <div class="card-value c-red">{{ flagged }}</div>
+      <div class="card-sub">Items needing attention</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Ready for AI Feedback</div>
+      <div class="card-value c-blue">{{ review_done }}</div>
+      <div class="card-sub"><a href="/process" style="color:#2563eb">Send to AI →</a></div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.5rem">
+
+    <div class="card">
+      <div class="section-label">Evidence by Status</div>
+      {% set st_colors = {'PENDING':'#94a3b8','REVIEWED':'#3b82f6','FLAGGED':'#dc2626','APPROVED':'#16a34a'} %}
+      {% for row in evidence_stats %}
+      <div style="margin-bottom:.625rem">
+        <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+          <span class="badge badge-st-{{ row.status }}">{{ row.status }}</span>
+          <span style="font-size:12px;color:#64748b;font-weight:600">{{ "{:,}".format(row.n) }}</span>
+        </div>
+        <div style="background:#f1f5f9;border-radius:4px;height:6px;overflow:hidden">
+          <div style="background:{{ st_colors.get(row.status,'#94a3b8') }};width:{{ [[(row.n / total_evidence * 100)|round(1), 100]|min, 0]|max }}%;height:100%;border-radius:4px"></div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="card">
+      <div class="section-label">Evidence by Confidence</div>
+      {% set cf_colors = {'HIGH':'#16a34a','APPROX':'#d97706','FIELD_REQ':'#ea580c','NA':'#6b7280','PENDING':'#94a3b8'} %}
+      {% for row in conf_stats %}
+      <div style="margin-bottom:.625rem">
+        <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+          <span class="badge badge-{{ row.plan_confidence }}">{{ row.plan_confidence }}</span>
+          <span style="font-size:12px;color:#64748b;font-weight:600">{{ "{:,}".format(row.n) }}</span>
+        </div>
+        <div style="background:#f1f5f9;border-radius:4px;height:6px;overflow:hidden">
+          <div style="background:{{ cf_colors.get(row.plan_confidence,'#94a3b8') }};width:{{ [[(row.n / total_evidence * 100)|round(1), 100]|min, 0]|max }}%;height:100%;border-radius:4px"></div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+  </div>
+
+  <div class="card" style="margin-bottom:1.5rem">
+    <div class="section-label">Bridge Processing Status</div>
+    <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-top:.25rem">
+      {% for row in bridge_stats %}
+      <div style="text-align:center;min-width:100px">
+        <div style="font-size:1.5rem;font-weight:700;color:#1e293b">{{ row.n }}</div>
+        <div style="font-size:11px;color:#64748b;margin-top:2px">{{ row.processing_status }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div style="display:flex;gap:.75rem;flex-wrap:wrap">
+    <a href="/review?conf=HIGH&status=PENDING" class="btn btn-primary">Review HIGH Confidence →</a>
+    <a href="/review?conf=APPROX&status=PENDING" class="btn btn-ghost">Review APPROX →</a>
+    <a href="/review?status=FLAGGED" class="btn btn-danger">Flagged Items →</a>
+    <a href="/review" class="btn btn-ghost">All Evidence →</a>
+  </div>
+
+</div>
+{% endblock %}

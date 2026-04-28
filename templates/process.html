@@ -1,0 +1,357 @@
+{% extends "base.html" %}
+{% block title %}AI Extraction — SNBI{% endblock %}
+{% block content %}
+<div class="page-full" id="process-app"
+     data-api-key-set="{{ 'true' if api_key_set else 'false' }}">
+
+  <div style="display:flex;align-items:flex-start;gap:1.5rem;flex-wrap:wrap">
+
+    <!-- LEFT: Bridge selector -->
+    <div style="flex:1;min-width:400px">
+
+      <h1 style="margin:0 0 1rem;font-size:1.25rem;font-weight:700">AI Extraction — Select Bridges</h1>
+
+      <!-- Status filter tabs -->
+      <div style="display:flex;gap:.375rem;margin-bottom:.875rem;flex-wrap:wrap">
+        <a href="/process" class="btn btn-sm {% if not status_filter %}btn-primary{% else %}btn-ghost{% endif %}">
+          All
+        </a>
+        {% for row in status_counts %}
+        <a href="/process?status={{ row.processing_status }}"
+           class="btn btn-sm {% if status_filter == row.processing_status %}btn-primary{% else %}btn-ghost{% endif %}">
+          {{ row.processing_status }} <span style="opacity:.7">({{ row.n }})</span>
+        </a>
+        {% endfor %}
+      </div>
+
+      <!-- Search + selection controls -->
+      <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.625rem;flex-wrap:wrap">
+        <input id="bridge-search" type="text" placeholder="Search bridge ID or name…"
+               oninput="filterTable()"
+               style="flex:1;min-width:200px;padding:5px 10px;border:1px solid #e2e8f0;
+                      border-radius:6px;font-size:13px;font-family:monospace">
+        <button class="btn btn-ghost btn-sm" onclick="selectByStatus('BRM_DONE')">Select Unprocessed</button>
+        <button class="btn btn-ghost btn-sm" onclick="selectByStatus('ERROR')">Select Errors</button>
+        <button class="btn btn-ghost btn-sm" onclick="clearSel()">Clear</button>
+        <span id="sel-count" style="font-size:12px;color:#64748b;margin-left:.25rem"></span>
+      </div>
+
+      <!-- Bridge table -->
+      <div class="table-wrap" style="max-height:calc(100vh - 320px);overflow-y:auto">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:32px"><input type="checkbox" id="sel-all" onchange="toggleAll(this)"></th>
+              <th>Bridge ID</th>
+              <th style="min-width:160px">Name</th>
+              <th>County</th>
+              <th>Status</th>
+              <th>Last Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for b in bridges %}
+            <tr data-id="{{ b.bridge_id }}" data-status="{{ b.processing_status }}">
+              <td><input type="checkbox" class="bc" data-id="{{ b.bridge_id }}" onchange="onCheck(this)"></td>
+              <td>
+                <a href="/bridge/{{ b.bridge_id }}"
+                   style="color:#2563eb;font-weight:600;font-family:monospace;text-decoration:none">
+                  {{ b.bridge_id }}</a>
+              </td>
+              <td style="font-size:12px">{{ b.bridge_name or '—' }}</td>
+              <td style="font-size:12px;color:#64748b">{{ b.county or '—' }}</td>
+              <td>
+                {% set sc = {
+                  'PENDING':    'badge-PENDING',
+                  'BRM_DONE':   'badge-APPROX',
+                  'PLANS_DONE': 'badge-HIGH',
+                  'ERROR':      'badge-FIELD_REQ',
+                  'COMPLETE':   'badge-HIGH'
+                } %}
+                <span class="badge {{ sc.get(b.processing_status, 'badge-PENDING') }}">
+                  {{ b.processing_status }}
+                </span>
+              </td>
+              <td style="font-size:11px;color:#94a3b8">
+                {{ b.updated_at[:10] if b.updated_at else '—' }}
+              </td>
+            </tr>
+            {% endfor %}
+            {% if not bridges %}
+            <tr><td colspan="6" style="text-align:center;padding:2rem;color:#94a3b8">No bridges found.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+
+    </div><!-- /left -->
+
+    <!-- RIGHT: Job control + progress -->
+    <div style="width:380px;min-width:320px;display:flex;flex-direction:column;gap:1rem">
+
+      <!-- API key + run -->
+      <div class="card">
+        <div class="section-label">Anthropic API Key</div>
+        <input id="api-key-input" type="password"
+               placeholder="{% if api_key_set %}Key loaded from environment{% else %}sk-ant-api03-…{% endif %}"
+               style="width:100%;padding:7px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;margin-bottom:.875rem;font-family:monospace">
+        <div style="font-size:11px;color:#94a3b8;margin-bottom:.875rem">
+          {% if api_key_set %}
+          ✓ Environment key available — leave blank to use it.
+          {% else %}
+          Paste your key above, or set ANTHROPIC_API_KEY environment variable.
+          {% endif %}
+        </div>
+        <div style="display:flex;gap:.5rem">
+          <button id="run-btn" class="btn btn-primary" style="flex:1" onclick="startJob()">
+            Run AI Extraction
+          </button>
+          <button id="stop-btn" class="btn btn-danger" style="display:none" onclick="stopJob()">
+            Stop
+          </button>
+        </div>
+      </div>
+
+      <!-- Feedback card -->
+      <div class="card" id="feedback-card">
+        <div class="section-label">Send Reviews to AI</div>
+        <div style="font-size:12px;color:#64748b;margin-bottom:.875rem;line-height:1.5">
+          Imports your determinations from completed bridge reviews, compares them to AI values,
+          and rebuilds lessons that get injected into future extractions.
+        </div>
+        {% if review_done_count > 0 %}
+        <div style="background:#dbeafe;border-radius:6px;padding:.625rem .875rem;margin-bottom:.875rem;
+                    font-size:13px;color:#1d4ed8;font-weight:600">
+          {{ review_done_count }} bridge{% if review_done_count != 1 %}s{% endif %} ready to send
+        </div>
+        {% else %}
+        <div style="background:#f1f5f9;border-radius:6px;padding:.625rem .875rem;margin-bottom:.875rem;
+                    font-size:12px;color:#94a3b8">
+          No bridges marked as review complete yet.
+        </div>
+        {% endif %}
+        <div style="display:flex;gap:.5rem">
+          <button id="fb-run-btn" class="btn btn-success" style="flex:1"
+                  onclick="startFeedback()"
+                  {% if review_done_count == 0 %}disabled style="flex:1;opacity:.5"{% endif %}>
+            Send to AI
+          </button>
+        </div>
+        <div id="fb-progress" style="display:none;margin-top:.875rem">
+          <div style="background:#f1f5f9;border-radius:6px;height:8px;overflow:hidden;margin-bottom:.5rem">
+            <div id="fb-bar" style="background:#16a34a;width:0%;height:100%;border-radius:6px;transition:width .3s"></div>
+          </div>
+          <span id="fb-current" style="font-size:12px;color:#374151;font-family:monospace"></span>
+          <div class="section-label" style="margin-top:.75rem">Log</div>
+          <div id="fb-log"
+               style="background:#0f172a;color:#e2e8f0;border-radius:6px;padding:.75rem;
+                      font-size:12px;font-family:monospace;line-height:1.6;
+                      height:220px;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></div>
+        </div>
+      </div>
+
+      <!-- Extraction Progress -->
+      <div class="card" id="progress-card" style="display:none">
+        <div class="section-label">Progress</div>
+
+        <!-- Progress bar -->
+        <div style="background:#f1f5f9;border-radius:6px;height:10px;overflow:hidden;margin-bottom:.5rem">
+          <div id="prog-bar" style="background:#2563eb;width:0%;height:100%;border-radius:6px;transition:width .3s"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:.75rem">
+          <span id="prog-text" style="font-size:12px;color:#64748b">0 / 0</span>
+          <span id="prog-current" style="font-size:12px;color:#374151;font-family:monospace"></span>
+        </div>
+
+        <!-- Stats row -->
+        <div style="display:flex;gap:1rem;margin-bottom:.875rem">
+          <div style="text-align:center">
+            <div id="stat-done" style="font-size:1.4rem;font-weight:700;color:#16a34a">0</div>
+            <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.05em">Done</div>
+          </div>
+          <div style="text-align:center">
+            <div id="stat-err" style="font-size:1.4rem;font-weight:700;color:#dc2626">0</div>
+            <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.05em">Errors</div>
+          </div>
+          <div style="text-align:center">
+            <div id="stat-rem" style="font-size:1.4rem;font-weight:700;color:#94a3b8">0</div>
+            <div style="font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.05em">Remaining</div>
+          </div>
+        </div>
+
+        <!-- Log output -->
+        <div class="section-label">Log</div>
+        <div id="log-box"
+             style="background:#0f172a;color:#e2e8f0;border-radius:6px;padding:.75rem;
+                    font-size:12px;font-family:monospace;line-height:1.6;
+                    height:280px;overflow-y:auto;white-space:pre-wrap;word-break:break-all">
+        </div>
+      </div>
+
+    </div><!-- /right -->
+
+  </div>
+
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+let polling = null;
+
+// Search filter
+function filterTable() {
+  const q = document.getElementById('bridge-search').value.trim().toLowerCase();
+  document.querySelectorAll('tbody tr[data-id]').forEach(tr => {
+    const id   = (tr.dataset.id   || '').toLowerCase();
+    const name = (tr.querySelector('td:nth-child(3)')?.textContent || '').toLowerCase();
+    tr.style.display = (!q || id.includes(q) || name.includes(q)) ? '' : 'none';
+  });
+  updateCount();
+}
+
+// Selection
+function getSelected() {
+  return [...document.querySelectorAll('.bc:checked')].map(cb => cb.dataset.id);
+}
+function updateCount() {
+  const n = getSelected().length;
+  document.getElementById('sel-count').textContent = n > 0 ? `${n} selected` : '';
+}
+function toggleAll(master) {
+  document.querySelectorAll('.bc').forEach(cb => {
+    cb.checked = master.checked;
+    cb.closest('tr').classList.toggle('selected', master.checked);
+  });
+  updateCount();
+}
+function onCheck(cb) {
+  cb.closest('tr').classList.toggle('selected', cb.checked);
+  updateCount();
+}
+function selectByStatus(status) {
+  document.querySelectorAll('.bc').forEach(cb => {
+    const isMatch = cb.closest('tr').dataset.status === status;
+    cb.checked = isMatch;
+    cb.closest('tr').classList.toggle('selected', isMatch);
+  });
+  updateCount();
+}
+function clearSel() {
+  document.querySelectorAll('.bc').forEach(cb => { cb.checked = false; cb.closest('tr').classList.remove('selected'); });
+  document.getElementById('sel-all').checked = false;
+  updateCount();
+}
+
+// Job control
+async function startJob() {
+  const ids = getSelected();
+  if (!ids.length) { toast('Select at least one bridge first', 'err'); return; }
+  const key = document.getElementById('api-key-input').value.trim();
+  const res = await api('/api/process/start', { bridge_ids: ids, api_key: key });
+  if (res.ok) {
+    setJobUI(true);
+    startPolling();
+    toast(`Started — processing ${ids.length} bridge(s)`);
+  } else {
+    toast(res.error || 'Failed to start', 'err');
+  }
+}
+
+async function stopJob() {
+  await api('/api/process/stop', {});
+  toast('Stop signal sent — finishing current bridge…');
+}
+
+function setJobUI(running) {
+  document.getElementById('run-btn').disabled = running;
+  document.getElementById('run-btn').style.opacity = running ? '.5' : '1';
+  document.getElementById('stop-btn').style.display = running ? 'inline-flex' : 'none';
+  document.getElementById('progress-card').style.display = 'block';
+}
+
+// Polling
+function startPolling() {
+  if (polling) return;
+  polling = setInterval(pollStatus, 2000);
+}
+
+async function pollStatus() {
+  const s = await fetch('/api/process/status').then(r => r.json());
+  updateProgressUI(s);
+  if (!s.running) {
+    clearInterval(polling);
+    polling = null;
+    setJobUI(false);
+  }
+}
+
+function updateProgressUI(s) {
+  const pct = s.total > 0 ? Math.round((s.done + s.errors) / s.total * 100) : 0;
+  document.getElementById('prog-bar').style.width = pct + '%';
+  document.getElementById('prog-text').textContent = `${s.done + s.errors} / ${s.total}`;
+  document.getElementById('prog-current').textContent = s.current || (s.running ? '…' : '');
+  document.getElementById('stat-done').textContent = s.done;
+  document.getElementById('stat-err').textContent  = s.errors;
+  document.getElementById('stat-rem').textContent  = Math.max(0, s.total - s.done - s.errors);
+
+  const box = document.getElementById('log-box');
+  const atBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 40;
+  box.textContent = (s.log || []).join('\n');
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+// On load: if a job is already running (e.g. page refresh), resume polling
+window.addEventListener('DOMContentLoaded', async () => {
+  const s = await fetch('/api/process/status').then(r => r.json());
+  if (s.running || s.log.length > 0) {
+    setJobUI(s.running);
+    updateProgressUI(s);
+    if (s.running) startPolling();
+  }
+  const fs = await fetch('/api/feedback/status').then(r => r.json());
+  if (fs.running || fs.log.length > 0) {
+    setFbUI(fs.running);
+    updateFbUI(fs);
+    if (fs.running) startFbPolling();
+  }
+});
+
+// ── Feedback job ─────────────────────────────────────────────
+let fbPolling = null;
+
+async function startFeedback() {
+  const key = document.getElementById('api-key-input').value.trim();
+  const res = await api('/api/feedback/start', { api_key: key });
+  if (res.ok) {
+    setFbUI(true);
+    startFbPolling();
+    toast('Sending reviews to AI…');
+  } else {
+    toast(res.error || 'Failed to start', 'err');
+  }
+}
+function setFbUI(running) {
+  const btn = document.getElementById('fb-run-btn');
+  btn.disabled = running;
+  btn.style.opacity = running ? '.5' : '1';
+  document.getElementById('fb-progress').style.display = 'block';
+}
+function startFbPolling() {
+  if (fbPolling) return;
+  fbPolling = setInterval(async () => {
+    const s = await fetch('/api/feedback/status').then(r => r.json());
+    updateFbUI(s);
+    if (!s.running) { clearInterval(fbPolling); fbPolling = null; setFbUI(false); }
+  }, 2000);
+}
+function updateFbUI(s) {
+  const pct = s.total > 0 ? Math.round(s.done / s.total * 100) : (s.running ? 30 : 0);
+  document.getElementById('fb-bar').style.width = pct + '%';
+  document.getElementById('fb-current').textContent = s.current || '';
+  const box = document.getElementById('fb-log');
+  const atBottom = box.scrollHeight - box.scrollTop <= box.clientHeight + 40;
+  box.textContent = (s.log || []).join('\n');
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,27 @@
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Excel / source data
+*.xlsx
+*.xls
+*.csv
+
+# PDF files
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Screenshots (user-uploaded evidence images)
+static/screenshots/
+
+# OS
+.DS_Store
+Thumbs.db

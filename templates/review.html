@@ -1,0 +1,275 @@
+{% extends "base.html" %}
+{% block title %}Review Queue — SNBI{% endblock %}
+{% block content %}
+<div class="page-full">
+
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:.5rem">
+    <h1 style="margin:0;font-size:1.25rem;font-weight:700">Review Queue</h1>
+    <div style="display:flex;align-items:center;gap:.5rem">
+      <label style="font-size:12px;color:#64748b;font-weight:600">Reviewer:</label>
+      <input id="reviewer-name" type="text" placeholder="Your name"
+             style="padding:5px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;width:150px">
+    </div>
+  </div>
+
+  <!-- Filters -->
+  <form method="get" class="filter-bar">
+    <div class="filter-group">
+      <span class="filter-label">Bridge</span>
+      <select name="bridge">
+        <option value="">All bridges</option>
+        {% for b in bridges %}
+        <option value="{{ b.bridge_id }}" {% if bridge_filter == b.bridge_id %}selected{% endif %}>
+          {{ b.bridge_id }}{% if b.bridge_name %} — {{ b.bridge_name[:28] }}{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-group">
+      <span class="filter-label">Item</span>
+      <input type="text" name="item" value="{{ item_filter }}" placeholder="e.g. B.G.01" style="width:130px">
+    </div>
+    <div class="filter-group">
+      <span class="filter-label">Confidence</span>
+      <div class="chips">
+        {% for c in ['HIGH','APPROX','FIELD_REQ','NA','PENDING'] %}
+        <label class="chip {% if c in conf_filter %}on{% endif %}">
+          <input type="checkbox" name="conf" value="{{ c }}" {% if c in conf_filter %}checked{% endif %}>{{ c }}
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="filter-group">
+      <span class="filter-label">Status</span>
+      <div class="chips">
+        {% for s in ['PENDING','REVIEWED','FLAGGED','APPROVED'] %}
+        <label class="chip {% if s in status_filter %}on{% endif %}">
+          <input type="checkbox" name="status" value="{{ s }}" {% if s in status_filter %}checked{% endif %}>{{ s }}
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="filter-group" style="justify-content:flex-end;margin-left:auto">
+      <button type="submit" class="btn btn-primary btn-sm">Apply</button>
+      <a href="/review" class="btn btn-ghost btn-sm" style="margin-top:4px">Clear</a>
+    </div>
+  </form>
+
+  <!-- Bulk actions -->
+  <div style="display:flex;align-items:center;gap:.625rem;margin-bottom:.75rem;flex-wrap:wrap">
+    <button class="btn btn-ghost btn-sm" onclick="selectAllHigh()">Select All HIGH</button>
+    <button class="btn btn-ghost btn-sm" onclick="clearSel()">Clear Selection</button>
+    <span id="sel-count" style="font-size:12px;color:#64748b"></span>
+    <div style="margin-left:auto">
+      <button id="bulk-btn" class="btn btn-success btn-sm" style="display:none" onclick="bulkApprove()">
+        Approve Selected
+      </button>
+    </div>
+  </div>
+
+  <div style="font-size:12px;color:#94a3b8;margin-bottom:.5rem">
+    {{ "{:,}".format(total) }} row{{ 's' if total != 1 }}
+    {% if total_pages > 1 %} &mdash; page {{ page }} of {{ total_pages }}{% endif %}
+  </div>
+
+  <div class="table-wrap">
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:32px"><input type="checkbox" id="sel-all" onchange="toggleAll(this)"></th>
+            <th>Bridge</th>
+            <th>Item</th>
+            <th>Feature</th>
+            <th style="min-width:140px">Name</th>
+            <th>BrM Value</th>
+            <th>Plan Value</th>
+            <th>Confidence</th>
+            <th style="min-width:170px">Reasoning</th>
+            <th style="min-width:90px">Source Pages</th>
+            <th style="min-width:120px">Determination</th>
+            <th style="min-width:120px">Notes</th>
+            <th style="min-width:130px">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr data-id="{{ row.id }}" data-conf="{{ row.plan_confidence }}">
+            <td><input type="checkbox" class="rc" data-id="{{ row.id }}" onchange="onRowCheck(this)"></td>
+            <td>
+              <a href="/bridge/{{ row.bridge_id }}"
+                 style="color:#2563eb;font-weight:600;text-decoration:none;font-family:monospace">
+                {{ row.bridge_id }}</a>
+              {% if row.county %}<div style="font-size:10px;color:#94a3b8">{{ row.county }}</div>{% endif %}
+            </td>
+            <td><span class="mono" style="font-size:12px">{{ row.item_id }}</span></td>
+            <td><span style="font-size:11px;color:#64748b">{{ row.feature_id }}</span></td>
+            <td style="font-size:12px">{{ row.item_name or '' }}</td>
+            <td><span class="mono" style="font-size:12px;color:#64748b">{{ row.brm_value or '—' }}</span></td>
+            <td><span class="mono" style="font-size:12px;font-weight:600">{{ row.plan_value or '—' }}</span></td>
+            <td><span class="badge badge-{{ row.plan_confidence }}">{{ row.plan_confidence }}</span></td>
+            <td>
+              <span class="reasoning" title="{{ row.plan_reasoning or '' }}">{{ row.plan_reasoning or '' }}</span>
+            </td>
+            <td>
+              <span class="source-text">{{ row.plan_source_pages or '' }}</span>
+            </td>
+            <td class="editable">
+              <input type="text" value="{{ row.user_determination or '' }}"
+                     data-field="user_determination" data-id="{{ row.id }}"
+                     placeholder="Enter value…"
+                     onblur="saveField(this)" onkeydown="if(event.key==='Enter')this.blur()">
+            </td>
+            <td class="editable">
+              <textarea data-field="user_notes" data-id="{{ row.id }}"
+                        placeholder="Notes…" rows="1"
+                        onblur="saveField(this)">{{ row.user_notes or '' }}</textarea>
+            </td>
+            <td>
+              <div class="status-btns">
+                <button class="s-btn s-btn-approve" title="Approve"
+                        onclick="setStatus({{ row.id }},this.closest('tr'),'APPROVED')">✓</button>
+                <button class="s-btn s-btn-review" title="Mark reviewed"
+                        onclick="setStatus({{ row.id }},this.closest('tr'),'REVIEWED')">R</button>
+                <button class="s-btn s-btn-flag" title="Flag for attention"
+                        onclick="setStatus({{ row.id }},this.closest('tr'),'FLAGGED')">⚑</button>
+              </div>
+              <span class="badge badge-st-{{ row.status }} status-badge" style="margin-top:4px">
+                {{ row.status }}
+              </span>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if not rows %}
+          <tr><td colspan="13" style="text-align:center;padding:3rem;color:#94a3b8">
+            No rows match the current filters.
+          </td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Pagination -->
+  {% if total_pages > 1 %}
+  <div class="pagination">
+    {% if page > 1 %}
+    <a class="pg-btn" href="{{ page_url(page - 1) }}">← Prev</a>
+    {% else %}
+    <span class="pg-btn disabled">← Prev</span>
+    {% endif %}
+
+    {% for p in range(1, total_pages + 1) %}
+      {% if p == page %}
+        <span class="pg-btn cur">{{ p }}</span>
+      {% elif p <= 2 or p > total_pages - 2 or (p >= page - 2 and p <= page + 2) %}
+        <a class="pg-btn" href="{{ page_url(p) }}">{{ p }}</a>
+      {% elif p == 3 or p == total_pages - 2 %}
+        <span style="color:#94a3b8;padding:0 4px">…</span>
+      {% endif %}
+    {% endfor %}
+
+    {% if page < total_pages %}
+    <a class="pg-btn" href="{{ page_url(page + 1) }}">Next →</a>
+    {% else %}
+    <span class="pg-btn disabled">Next →</span>
+    {% endif %}
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+// Chip toggle visual
+document.querySelectorAll('.chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    setTimeout(() => chip.classList.toggle('on', chip.querySelector('input').checked), 0);
+  });
+});
+
+// Selection state
+function getCheckedIds() {
+  return [...document.querySelectorAll('.rc:checked')].map(cb => parseInt(cb.dataset.id));
+}
+function updateBulkUI() {
+  const n = getCheckedIds().length;
+  document.getElementById('sel-count').textContent = n > 0 ? `${n} selected` : '';
+  document.getElementById('bulk-btn').style.display = n > 0 ? 'inline-flex' : 'none';
+}
+function toggleAll(master) {
+  document.querySelectorAll('.rc').forEach(cb => {
+    cb.checked = master.checked;
+    cb.closest('tr').classList.toggle('selected', master.checked);
+  });
+  updateBulkUI();
+}
+function onRowCheck(cb) {
+  cb.closest('tr').classList.toggle('selected', cb.checked);
+  updateBulkUI();
+}
+function selectAllHigh() {
+  document.querySelectorAll('.rc').forEach(cb => {
+    const isHigh = cb.closest('tr').dataset.conf === 'HIGH';
+    cb.checked = isHigh;
+    cb.closest('tr').classList.toggle('selected', isHigh);
+  });
+  updateBulkUI();
+}
+function clearSel() {
+  document.querySelectorAll('.rc').forEach(cb => { cb.checked = false; cb.closest('tr').classList.remove('selected'); });
+  document.getElementById('sel-all').checked = false;
+  updateBulkUI();
+}
+
+// Reviewer name
+const nameInput = document.getElementById('reviewer-name');
+nameInput.value = localStorage.getItem('snbi_reviewer') || '';
+document.getElementById('reviewer-display').textContent =
+  nameInput.value ? `Logged in as: ${nameInput.value}` : '';
+nameInput.addEventListener('input', () => {
+  localStorage.setItem('snbi_reviewer', nameInput.value);
+  document.getElementById('reviewer-display').textContent =
+    nameInput.value ? `Logged in as: ${nameInput.value}` : '';
+});
+function getReviewer() { return nameInput.value.trim(); }
+
+// Save field on blur
+async function saveField(el) {
+  const res = await api(`/api/evidence/${el.dataset.id}`, {
+    [el.dataset.field]: el.value,
+    reviewed_by: getReviewer()
+  });
+  if (!res.ok) toast('Save failed', 'err');
+}
+
+// Set status for one row
+async function setStatus(id, tr, status) {
+  const res = await api(`/api/evidence/${id}`, { status, reviewed_by: getReviewer() });
+  if (res.ok) {
+    const b = tr.querySelector('.status-badge');
+    if (b) { b.className = `badge badge-st-${status} status-badge`; b.textContent = status; }
+    toast(status === 'APPROVED' ? 'Approved' : status === 'FLAGGED' ? 'Flagged' : 'Marked reviewed');
+  } else { toast('Error saving status', 'err'); }
+}
+
+// Bulk approve
+async function bulkApprove() {
+  const ids = getCheckedIds();
+  if (!ids.length) return;
+  if (!confirm(`Approve ${ids.length} selected row${ids.length > 1 ? 's' : ''}?`)) return;
+  const res = await api('/api/evidence/bulk-approve', { ids, reviewer: getReviewer() });
+  if (res.ok) {
+    document.querySelectorAll('.rc:checked').forEach(cb => {
+      const tr = cb.closest('tr');
+      const b = tr.querySelector('.status-badge');
+      if (b) { b.className = 'badge badge-st-APPROVED status-badge'; b.textContent = 'APPROVED'; }
+      cb.checked = false;
+      tr.classList.remove('selected');
+    });
+    updateBulkUI();
+    toast(`${res.updated} row${res.updated > 1 ? 's' : ''} approved`);
+  } else { toast('Bulk approve failed', 'err'); }
+}
+</script>
+{% endblock %}
