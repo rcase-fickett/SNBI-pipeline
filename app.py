@@ -553,6 +553,11 @@ def bridge_detail(bridge_id):
     prev_id = all_ids[idx - 1] if idx > 0 else None
     next_id = all_ids[idx + 1] if 0 <= idx < len(all_ids) - 1 else None
 
+    # Bridge log raw entry (from 07_import_bridge_log.py)
+    log_row = conn.execute(
+        "SELECT raw_entry, imported_at FROM bridge_log WHERE bridge_id = ?", (bridge_id,)
+    ).fetchone()
+
     conn.close()
     has_pdf = find_pdf(bridge_id) is not None
     return render_template("bridge.html",
@@ -565,7 +570,9 @@ def bridge_detail(bridge_id):
         prev_id=prev_id,
         next_id=next_id,
         position=idx + 1,
-        total=len(all_ids))
+        total=len(all_ids),
+        log_entry=log_row["raw_entry"] if log_row else None,
+        log_imported_at=log_row["imported_at"] if log_row else None)
 
 
 # ── API: update one evidence row ──────────────────────────────────────────────
@@ -675,10 +682,8 @@ def delete_screenshot_route(shot_id):
 @app.route("/api/feature/<bridge_id>/<feature_id>", methods=["DELETE"])
 def delete_feature_group(bridge_id, feature_id):
     conn = get_db()
-    conn.execute(
-        "DELETE FROM evidence WHERE bridge_id=? AND feature_id=?",
-        (bridge_id, feature_id)
-    )
+    conn.execute("DELETE FROM features WHERE bridge_id=? AND designation=?", (bridge_id, feature_id))
+    conn.execute("DELETE FROM evidence WHERE bridge_id=? AND feature_id=?", (bridge_id, feature_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -734,6 +739,14 @@ def add_feature(bridge_id):
         if item["id"] == "B.F.02":
             row["plan_value"] = location
         upsert_evidence(conn, row)
+
+    # Register feature in features table with SNBI-format UUID
+    import uuid as _uuid
+    feature_uuid = _uuid.uuid4().hex[:8].upper()
+    conn.execute(
+        "INSERT OR IGNORE INTO features (id, bridge_id, designation, feature_type, location) VALUES (?,?,?,?,?)",
+        (feature_uuid, bridge_id, feature_id, feat_type, location)
+    )
 
     conn.commit()
     conn.close()
@@ -813,31 +826,21 @@ def bulk_approve():
     return jsonify({"ok": True, "updated": len(ids)})
 
 
+# ── Item Coding Guide ────────────────────────────────────────────────────────
+
+@app.route("/items")
+def items_guide():
+    from lib.snbi_items import ITEMS
+    return render_template("items.html", items=ITEMS)
+
+
 # ── Process page ─────────────────────────────────────────────────────────────
 
 @app.route("/process")
 def process_page():
     if not db_exists():
         return render_template("no_db.html")
-    status_filter = request.args.get("status", "")
-    conn    = get_db()
-    where   = "WHERE b.processing_status = ?" if status_filter else ""
-    params  = [status_filter] if status_filter else []
-    bridges = conn.execute(f"""
-        SELECT b.bridge_id, b.bridge_name, b.county, b.processing_status, b.updated_at,
-               COUNT(e.id) as total_items,
-               SUM(CASE WHEN e.plan_confidence != 'PENDING' THEN 1 ELSE 0 END) as extracted
-        FROM bridges b LEFT JOIN evidence e ON b.bridge_id = b.bridge_id
-        {where}
-        GROUP BY b.bridge_id
-        ORDER BY b.processing_status, b.bridge_id
-    """, params).fetchall()
-    # simpler query — the join above is self-referential bug, fix it
-    bridges = conn.execute(f"""
-        SELECT bridge_id, bridge_name, county, processing_status, updated_at
-        FROM bridges {"WHERE processing_status = ?" if status_filter else ""}
-        ORDER BY processing_status, bridge_id
-    """, params).fetchall()
+    conn = get_db()
     status_counts = conn.execute(
         "SELECT processing_status, COUNT(*) n FROM bridges GROUP BY processing_status ORDER BY n DESC"
     ).fetchall()
@@ -846,12 +849,51 @@ def process_page():
     ).fetchone()[0]
     conn.close()
     return render_template("process.html",
-        bridges=bridges, status_counts=status_counts,
-        status_filter=status_filter,
+        status_counts=status_counts,
         api_key_set=bool(os.environ.get("ANTHROPIC_API_KEY")),
         job=dict(_job),
         fb_job=dict(_fb_job),
         review_done_count=review_done_count)
+
+
+@app.route("/api/bridges")
+def api_bridges():
+    """Search/filter bridges — returns JSON for AJAX table population."""
+    q      = request.args.get("q", "").strip()
+    status = request.args.get("status", "").strip()
+    limit  = min(int(request.args.get("limit", 50)), 200)
+    conn   = get_db()
+    where, params = [], []
+    if status:
+        where.append("processing_status = ?"); params.append(status)
+    if q:
+        where.append("(bridge_id LIKE ? OR bridge_name LIKE ? OR county LIKE ?)")
+        params += [f"%{q}%", f"%{q}%", f"%{q}%"]
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows  = conn.execute(
+        f"SELECT bridge_id, bridge_name, county, processing_status, updated_at "
+        f"FROM bridges {where_sql} ORDER BY bridge_id LIMIT ?",
+        params + [limit]
+    ).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) FROM bridges {where_sql}", params).fetchone()[0]
+    conn.close()
+    return jsonify({
+        "bridges": [dict(r) for r in rows],
+        "total":   total,
+        "showing": len(rows),
+    })
+
+
+@app.route("/api/bridge-ids")
+def api_bridge_ids():
+    """Return all bridge IDs matching a status — used by Select Unprocessed etc."""
+    status = request.args.get("status", "").strip()
+    conn   = get_db()
+    where  = "WHERE processing_status = ?" if status else ""
+    params = [status] if status else []
+    rows   = conn.execute(f"SELECT bridge_id FROM bridges {where} ORDER BY bridge_id", params).fetchall()
+    conn.close()
+    return jsonify({"ids": [r[0] for r in rows]})
 
 
 @app.route("/api/process/start", methods=["POST"])

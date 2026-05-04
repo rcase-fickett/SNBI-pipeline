@@ -1,0 +1,200 @@
+{% extends "base.html" %}
+{% block title %}Item Coding Guide — SNBI Review{% endblock %}
+
+{% block head %}
+<style>
+.chain{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.chain-arrow{color:#cbd5e1;font-size:12px;font-weight:700;flex-shrink:0}
+.src{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;white-space:nowrap;line-height:1.6}
+.src-brm{background:#e2e8f0;color:#334155}
+.src-PLAN{background:#dbeafe;color:#1d4ed8}
+.src-SECTION{background:#ede9fe;color:#6d28d9}
+.src-RAIL{background:#fef9c3;color:#854d0e}
+.src-NOTES{background:#ccfbf1;color:#0f766e}
+.src-VICINITY{background:#e0e7ff;color:#4338ca}
+.src-BENT{background:#f1f5f9;color:#475569}
+.src-CLEARANCE{background:#fee2e2;color:#b91c1c}
+.src-rec-plan{background:#dcfce7;color:#15803d}
+.src-rec-brm{background:#f1f5f9;color:#475569}
+.src-rec-none{background:#fef9c3;color:#854d0e}
+.rec-rule{font-size:10px;font-style:italic;margin-top:3px;color:#64748b;max-width:220px;line-height:1.4}
+.group-hdr td{background:#f8fafc;padding:8px 14px;font-size:11px;font-weight:700;
+              text-transform:uppercase;letter-spacing:.07em;color:#64748b;
+              border-top:2px solid #e2e8f0;border-bottom:1px solid #e2e8f0}
+td.notes-col{font-size:11px;color:#475569;line-height:1.5;max-width:300px}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.25rem;flex-wrap:wrap">
+    <div>
+      <h1 style="margin:0;font-size:1.25rem;font-weight:700">Item Coding Guide</h1>
+      <p style="margin:4px 0 0;font-size:13px;color:#64748b">
+        For each SNBI item: where the value starts, what the AI searches, and how the final recommendation is chosen.
+      </p>
+    </div>
+    <div style="margin-left:auto;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+      {% for label, cls in [('BrM seed','src-brm'),('PLAN','src-PLAN'),('SECTION','src-SECTION'),
+                            ('RAIL','src-RAIL'),('NOTES','src-NOTES'),('VICINITY','src-VICINITY'),
+                            ('CLEARANCE','src-CLEARANCE'),('Plan wins','src-rec-plan'),('BrM fallback','src-rec-brm')] %}
+      <span class="src {{ cls }}">{{ label }}</span>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:88px">Item</th>
+          <th style="min-width:160px">Name</th>
+          <th style="min-width:280px">Source Chain</th>
+          <th style="min-width:260px">Coding Guidance</th>
+        </tr>
+      </thead>
+      <tbody>
+
+        {# ── PRIMARY items ── #}
+        <tr class="group-hdr"><td colspan="4">Primary (bridge-level items)</td></tr>
+        {% for item in items if item.table == 'PRIMARY' %}
+        <tr>
+          <td><span class="mono" style="font-size:12px;font-weight:700">{{ item.id }}</span></td>
+          <td style="font-size:13px">{{ item.name }}</td>
+          <td>
+            <div class="chain">
+              {# Step 1: BrM seed (if mapped) #}
+              {% if item.brm_col %}
+              <span class="src src-brm" title="Phase 1 seeds this from BrM column '{{ item.brm_col }}'">
+                BrM: {{ item.brm_col }}
+              </span>
+              <span class="chain-arrow">→</span>
+              {% endif %}
+
+              {# Step 2: Plan pages AI searches #}
+              {% for pt in item.page_types %}
+              <span class="src src-{{ pt }}" title="AI extracts from {{ pt }} pages">{{ pt }}</span>
+              {% endfor %}
+
+              <span class="chain-arrow">→</span>
+
+              {# Step 3: Recommendation rule #}
+              {% if item.brm_col %}
+              <div>
+                <span class="src src-rec-plan">Plan (HIGH/APPROX)</span>
+                <span class="chain-arrow">else</span>
+                <span class="src src-rec-brm">BrM fallback</span>
+                <div class="rec-rule">If AI finds a value → use it. If not → fall back to BrM.</div>
+              </div>
+              {% else %}
+              <div>
+                <span class="src src-rec-plan">Plan value</span>
+                <span class="chain-arrow">or</span>
+                <span class="src src-rec-none">PENDING</span>
+                <div class="rec-rule">No BrM source — plan extraction only.</div>
+              </div>
+              {% endif %}
+            </div>
+          </td>
+          <td class="notes-col">{{ item.notes }}</td>
+        </tr>
+        {% endfor %}
+
+        {# ── WORK items ── #}
+        <tr class="group-hdr"><td colspan="4">Work Records (one per rehab event)</td></tr>
+        {% for item in items if item.table == 'WORK' %}
+        <tr>
+          <td><span class="mono" style="font-size:12px;font-weight:700">{{ item.id }}</span></td>
+          <td style="font-size:13px">{{ item.name }}</td>
+          <td>
+            <div class="chain">
+              {% for pt in item.page_types %}
+              <span class="src src-{{ pt }}">{{ pt }}</span>
+              {% endfor %}
+              <span class="chain-arrow">→</span>
+              <div>
+                <span class="src src-rec-plan">Plan value</span>
+                <div class="rec-rule">No BrM source. AI detects work events from plan sheets and notes.</div>
+              </div>
+            </div>
+          </td>
+          <td class="notes-col">{{ item.notes }}</td>
+        </tr>
+        {% endfor %}
+
+        {# ── FEATURE items ── #}
+        <tr class="group-hdr"><td colspan="4">Feature Items (per highway / waterway / railroad / pathway)</td></tr>
+        {% for item in items if item.table == 'FEATURE' %}
+        <tr>
+          <td><span class="mono" style="font-size:12px;font-weight:700">{{ item.id }}</span></td>
+          <td style="font-size:13px">
+            {{ item.name }}
+            {% if item.applies_to and item.applies_to != 'ALL' %}
+            <span style="font-size:10px;color:#94a3b8;font-weight:600;margin-left:4px">
+              ({{ {'H':'highway','W':'waterway','R':'railroad'}[item.applies_to] or item.applies_to }} only)
+            </span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="chain">
+              {# Some feature items have a BrM col (e.g. B.H.16) #}
+              {% if item.brm_col %}
+              <span class="src src-brm" title="Phase 1 seeds this from BrM column '{{ item.brm_col }}'">
+                BrM: {{ item.brm_col }}
+              </span>
+              <span class="chain-arrow">→</span>
+              {% endif %}
+
+              {% for pt in item.page_types %}
+              <span class="src src-{{ pt }}">{{ pt }}</span>
+              {% endfor %}
+
+              <span class="chain-arrow">→</span>
+
+              {% if item.brm_col %}
+              <div>
+                <span class="src src-rec-plan">Plan (HIGH/APPROX)</span>
+                <span class="chain-arrow">else</span>
+                <span class="src src-rec-brm">BrM fallback</span>
+              </div>
+              {% else %}
+              <div>
+                <span class="src src-rec-plan">Plan value</span>
+                <span class="chain-arrow">or</span>
+                <span class="src src-rec-none">PENDING</span>
+              </div>
+              {% endif %}
+            </div>
+          </td>
+          <td class="notes-col">{{ item.notes }}</td>
+        </tr>
+        {% endfor %}
+
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  {# ── Confidence legend ── #}
+  <div style="margin-top:1.25rem;background:#fff;border:1px solid #e2e8f0;border-radius:8px;
+              padding:1rem 1.25rem">
+    <div class="section-label">Confidence levels (set by AI during plan extraction)</div>
+    <div style="display:flex;gap:1.5rem;flex-wrap:wrap;margin-top:.5rem">
+      {% for conf, desc in [
+        ('HIGH',      'Clearly shown on plans — use directly'),
+        ('APPROX',    'Derived or calculated — verify in field'),
+        ('FIELD_REQ', 'Cannot be read from plans — must measure'),
+        ('NA',        'Not applicable per SNBI spec'),
+        ('PENDING',   'Not yet extracted — BrM fallback used'),
+      ] %}
+      <div style="display:flex;align-items:center;gap:6px">
+        <span class="badge badge-{{ conf }}">{{ conf }}</span>
+        <span style="font-size:12px;color:#475569">{{ desc }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+</div>
+{% endblock %}
