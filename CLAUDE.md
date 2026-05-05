@@ -134,7 +134,7 @@ Evidence rows use `feature_id` to distinguish: `PRIMARY` (bridge-level), `WORK:Y
 
 ## Source Control
 
-Code is versioned at `https://github.com/reedcase1-alt/SNBI-pipeline` (private). The database (`snbi_evidence.db`), Excel exports (`*.xlsx`), PDFs, and CSV outputs are excluded via `.gitignore` — those are backed up by OneDrive only. To push after making changes: `git add . && git commit -m "..." && git push`. If push fails with "repository not found", check Windows Credential Manager — the stored GitHub credential must be for account `reedcase1-alt`, not any other account on the machine.
+Code is versioned at `https://github.com/rcase-fickett/SNBI-pipeline` (private). The database (`snbi_evidence.db`), Excel exports (`*.xlsx`), PDFs, and CSV outputs are excluded via `.gitignore` — those are backed up by OneDrive only. To push after making changes: `git add . && git commit -m "..." && git push`. GitHub account is `rcase-fickett` — credentials are stored in Windows Credential Manager.
 
 ## Important Constraints
 
