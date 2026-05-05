@@ -65,7 +65,7 @@ The app is distributed as a click-to-launch desktop icon — no terminal require
 - `Create Desktop Shortcut.bat` — Run once per machine to drop an "SNBI Review" icon on the Desktop. Double-click to run — no right-click needed.
 
 **First-time setup on a new machine:**
-1. Open the project folder on OneDrive
+1. Open the project folder: `C:\Users\<username>\Fickett Structural Solutions\Appsheet Data - Documents\Claude Apps\SNBI Pipeline`
 2. Double-click `Create Desktop Shortcut.bat`
 3. Double-click the new "SNBI Review" icon on the Desktop
 4. Enter the Anthropic API key and bridge folder path when prompted
