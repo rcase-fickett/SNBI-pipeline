@@ -314,9 +314,6 @@ def seed_features(conn, bridge_id, features, dry_run):
 
         # Type-specific items
         for item_id in _TYPE_ITEMS.get(ftype, ()):
-            # B.H.18 does not apply to carried-on highway features
-            if item_id == "B.H.18" and ftype == "H" and loc == "C":
-                continue
             if ftype == "H" and loc == "C" and item_id in _CARRIED_H_PREFILLS:
                 # Known not-applicable value for carried-on highway clearance items
                 val        = _CARRIED_H_PREFILLS[item_id]
@@ -335,7 +332,7 @@ def run_backfill(args):
     Backfill type-specific PENDING rows for H*/R*/W* features that were seeded
     before Phase 11 (e.g. by Phase 9 or Phase 1 BrM import) and are missing items
     like B.H.08, B.H.16, B.H.18, B.RR.02, B.RR.03, B.N.02-06.
-    B.H.18 is seeded for non-carried H* features only; carried-on features are skipped.
+    B.H.18 is seeded for all H* features including carried-on.
     Also removes any B.H.18 rows incorrectly keyed to crossing bridge IDs or 'NONE'.
     Uses INSERT OR IGNORE — never overwrites existing rows.
     """
@@ -401,9 +398,6 @@ def run_backfill(args):
         inserted = 0
         for item_id in _TYPE_ITEMS.get(ftype, ()):
             if item_id in existing_items:
-                continue
-            # B.H.18 does not apply to carried-on highway features
-            if item_id == "B.H.18" and ftype == "H" and loc == "C":
                 continue
             if ftype == "H" and loc == "C" and item_id in _CARRIED_H_PREFILLS:
                 val, confidence = _CARRIED_H_PREFILLS[item_id], "APPROX"
