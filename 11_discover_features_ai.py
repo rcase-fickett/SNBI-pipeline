@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import DB_PATH, ANTHROPIC_API_KEY, CLAUDE_MODEL, BATCH_DELAY_SEC
 from lib.db import get_conn
-from lib.geo_context import gather_feature_context, find_nearby_bridges
+from lib.geo_context import gather_feature_context
 from lib.snbi_items import ITEM_BY_ID
 
 SOURCE = "ODOT TransGIS + OSM (11_discover_features_ai)"
@@ -64,7 +64,7 @@ SYSTEM_PROMPT = (
 
 # Items seeded as PENDING (null plan_value) for each feature type — filled by Phase 2 / inspector
 _TYPE_ITEMS = {
-    "H": ("B.H.08", "B.H.12", "B.H.13", "B.H.14", "B.H.15", "B.H.16"),
+    "H": ("B.H.08", "B.H.12", "B.H.13", "B.H.14", "B.H.15", "B.H.16", "B.H.18"),
     "R": ("B.RR.01", "B.RR.02", "B.RR.03"),
     "W": ("B.N.01", "B.N.02", "B.N.03", "B.N.04", "B.N.05", "B.N.06"),
 }
@@ -314,6 +314,9 @@ def seed_features(conn, bridge_id, features, dry_run):
 
         # Type-specific items
         for item_id in _TYPE_ITEMS.get(ftype, ()):
+            # B.H.18 does not apply to carried-on highway features
+            if item_id == "B.H.18" and ftype == "H" and loc == "C":
+                continue
             if ftype == "H" and loc == "C" and item_id in _CARRIED_H_PREFILLS:
                 # Known not-applicable value for carried-on highway clearance items
                 val        = _CARRIED_H_PREFILLS[item_id]
@@ -327,78 +330,13 @@ def seed_features(conn, bridge_id, features, dry_run):
     return inserted
 
 
-def _h18_radius(bridge_length_ft):
-    """
-    Compute B.H.18 proximity search radius from bridge length.
-    A crossing bridge can be at most bridge_length/2 from the centroid, so
-    radius = max(50m, min(length_ft * 0.3048 / 2, 400m)).
-    Falls back to 200m if length is unknown.
-    """
-    try:
-        metres = float(bridge_length_ft) * 0.3048 / 2
-        return max(50, min(int(metres), 400))
-    except (TypeError, ValueError):
-        return 200
-
-
-def seed_h18_crossings(conn, bridge_id, lat, lon, dry_run, bridge_length_ft=None):
-    """
-    Seed B.H.18 (Crossing Bridge Number) for every bridge — required item on all structures.
-
-    Search radius is scaled to bridge length (B.G.01): a 30 ft bridge searches 50m;
-    a 1,000 ft bridge searches ~150m; capped at 400m. Falls back to 200m if unknown.
-
-    If crossing bridges are detected: seed one row per crossing bridge
-      (feature_id = crossing bridge ID, plan_value = crossing bridge ID, APPROX).
-    If none detected and no B.H.18 rows exist yet: seed one blank PENDING row
-      (feature_id = 'NONE', plan_value = None) with reasoning noting no crossing detected.
-
-    Uses INSERT OR IGNORE — safe to re-run. Returns count of rows inserted.
-    """
-    radius_m = _h18_radius(bridge_length_ft)
-    nearby   = find_nearby_bridges(bridge_id, lat, lon, radius_m=radius_m)
-    inserted = 0
-
-    if nearby:
-        for nb in nearby:
-            crossing_id = nb["bridge_id"]
-            if not crossing_id:
-                continue
-            inserted += _insert_row(conn, bridge_id, "B.H.18", crossing_id, crossing_id, "APPROX", dry_run)
-    else:
-        # Only seed the no-crossing placeholder if no B.H.18 rows exist at all for this bridge
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM evidence WHERE bridge_id=? AND item_id='B.H.18'",
-            (bridge_id,)
-        ).fetchone()[0]
-        if not existing:
-            item = ITEM_BY_ID.get("B.H.18", {})
-            reason = (f"No crossing bridge detected within {radius_m}m"
-                      if bridge_length_ft else "No crossing bridge detected within 200m")
-            if not dry_run:
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO evidence "
-                    "(bridge_id, item_id, feature_id, item_name, plan_value, "
-                    "plan_confidence, plan_reasoning, brm_source_col, status) "
-                    "VALUES (?,?,?,?,?,?,?,?,'PENDING')",
-                    (bridge_id, "B.H.18", "NONE",
-                     item.get("name", "B.H.18"), None, "PENDING",
-                     reason, SOURCE),
-                )
-                inserted = cur.rowcount
-            else:
-                inserted = 1
-
-    return inserted
-
-
 def run_backfill(args):
     """
     Backfill type-specific PENDING rows for H*/R*/W* features that were seeded
     before Phase 11 (e.g. by Phase 9 or Phase 1 BrM import) and are missing items
-    like B.H.08, B.H.16, B.RR.02, B.RR.03, B.N.02-06.
-    Also cleans up B.H.18 rows incorrectly seeded per H*/R*/W* feature_id and
-    re-seeds B.H.18 via proximity detection (feature_id = crossing bridge ID).
+    like B.H.08, B.H.16, B.H.18, B.RR.02, B.RR.03, B.N.02-06.
+    B.H.18 is seeded for non-carried H* features only; carried-on features are skipped.
+    Also removes any B.H.18 rows incorrectly keyed to crossing bridge IDs or 'NONE'.
     Uses INSERT OR IGNORE — never overwrites existing rows.
     """
     conn = get_conn(DB_PATH)
@@ -409,22 +347,19 @@ def run_backfill(args):
     if args.dry_run:
         print("  DRY RUN - no changes written\n")
 
-    # ── Step 1: Clean up B.H.18 rows incorrectly keyed to H*/R*/W*/P* feature_ids ──
-    # Correct feature_ids for B.H.18 are numeric bridge IDs (e.g. "02682").
-    # Wrong ones start with a letter (H01, H02, R01, W01, P01, etc.).
-    # SNBI feature codes are 1 letter + 2 digits (H01, H02, R01, W01, P01...) — max 4 chars.
-    # Legitimate ODOT crossing bridge IDs like R7040A, N8588E are 5-6+ chars. Use LENGTH <=4.
+    # ── Step 1: Remove B.H.18 rows not keyed to H* feature IDs ─────────────────
+    # B.H.18 belongs on non-carried H* features only (feature_id like H01, H02...).
+    # Previous runs may have left rows keyed to crossing bridge IDs or 'NONE' — delete them.
     wrong_count = conn.execute(
         "SELECT COUNT(*) FROM evidence "
-        "WHERE item_id='B.H.18' AND LENGTH(feature_id) <= 4 AND feature_id GLOB '[A-Z][0-9]*'"
+        "WHERE item_id='B.H.18' AND feature_id NOT GLOB 'H[0-9]*'"
     ).fetchone()[0]
 
     if wrong_count:
-        print(f"  Removing {wrong_count} B.H.18 row(s) incorrectly keyed to feature_ids...")
+        print(f"  Removing {wrong_count} B.H.18 row(s) not keyed to H* features...")
         if not args.dry_run:
             conn.execute(
-                "DELETE FROM evidence WHERE item_id='B.H.18' "
-                "AND LENGTH(feature_id) <= 4 AND feature_id GLOB '[A-Z][0-9]*'"
+                "DELETE FROM evidence WHERE item_id='B.H.18' AND feature_id NOT GLOB 'H[0-9]*'"
             )
             conn.commit()
     else:
@@ -467,6 +402,9 @@ def run_backfill(args):
         for item_id in _TYPE_ITEMS.get(ftype, ()):
             if item_id in existing_items:
                 continue
+            # B.H.18 does not apply to carried-on highway features
+            if item_id == "B.H.18" and ftype == "H" and loc == "C":
+                continue
             if ftype == "H" and loc == "C" and item_id in _CARRIED_H_PREFILLS:
                 val, confidence = _CARRIED_H_PREFILLS[item_id], "APPROX"
             else:
@@ -482,50 +420,11 @@ def run_backfill(args):
 
     if not args.dry_run:
         conn.commit()
-
-    # ── Step 3: B.H.18 proximity seeding ─────────────────────────────────────────
-    bridge_rows = conn.execute(
-        "SELECT b.bridge_id, b.lat, b.lon, e.brm_value AS length_ft "
-        "FROM bridges b "
-        "LEFT JOIN evidence e ON e.bridge_id=b.bridge_id AND e.item_id='B.G.01' "
-        "WHERE b.lat IS NOT NULL AND b.lon IS NOT NULL"
-        + (" AND b.bridge_id=?" if args.bridge else "")
-        + " ORDER BY b.bridge_id",
-        (args.bridge,) if args.bridge else ()
-    ).fetchall()
-
-    print(f"  Bridges for B.H.18 : {len(bridge_rows)} (have coordinates)")
-
-    h18_bridges = h18_rows = 0
-    import time as _time
-
-    for br in bridge_rows:
-        bid = br["bridge_id"]
-        try:
-            lat, lon = float(br["lat"]), float(br["lon"])
-        except (ValueError, TypeError):
-            continue
-
-        length_ft = float(br["length_ft"]) if br["length_ft"] else None
-        n = seed_h18_crossings(conn, bid, lat, lon, args.dry_run, length_ft)
-        if n:
-            h18_bridges += 1
-            h18_rows    += n
-            label = "[DRY RUN] " if args.dry_run else ""
-            if args.verbose or args.bridge:
-                radius = _h18_radius(length_ft)
-                print(f"  {label}[{bid}] B.H.18: +{n} row(s) (radius={radius}m)")
-        _time.sleep(0.2)  # courtesy delay for ODOT GIS server
-
-    if not args.dry_run:
-        conn.commit()
     conn.close()
 
     print(f"\n  B.H.18 rows removed  : {wrong_count}")
     print(f"  Features updated     : {features_updated}")
-    print(f"  Type-item rows added : {type_rows}")
-    print(f"  Bridges w/ B.H.18    : {h18_bridges}")
-    print(f"  B.H.18 rows added    : {h18_rows}")
+    print(f"  Evidence rows added  : {type_rows}")
     if args.dry_run:
         print("\n  Dry run complete - run without --dry-run to apply.")
     else:
@@ -567,7 +466,7 @@ def run(args):
     if args.dry_run:
         print("  DRY RUN - no changes written\n")
 
-    no_coords = skipped = bridges_updated = total_rows = h18_total = 0
+    no_coords = skipped = bridges_updated = total_rows = 0
 
     for bridge_row in rows:
         bridge_id = bridge_row["bridge_id"]
@@ -615,18 +514,6 @@ def run(args):
                 if args.verbose:
                     print(f"  [{bridge_id}] All returned features already exist")
 
-        # B.H.18 — proximity-based crossing bridge detection (no API call)
-        length_row = conn.execute(
-            "SELECT brm_value FROM evidence WHERE bridge_id=? AND item_id='B.G.01' LIMIT 1",
-            (bridge_id,)
-        ).fetchone()
-        bridge_length_ft = float(length_row["brm_value"]) if length_row and length_row["brm_value"] else None
-        n_h18 = seed_h18_crossings(conn, bridge_id, lat, lon, args.dry_run, bridge_length_ft)
-        h18_total += n_h18
-        if n_h18 and args.verbose:
-            radius = _h18_radius(bridge_length_ft)
-            print(f"  [{bridge_id}] B.H.18: +{n_h18} row(s) (radius={radius}m, length={bridge_length_ft or '?'}ft)")
-
     if not args.dry_run:
         conn.commit()
     conn.close()
@@ -636,7 +523,6 @@ def run(args):
     print(f"  Nothing new to add   : {skipped}")
     print(f"  Bridges updated      : {bridges_updated}")
     print(f"  Evidence rows added  : {total_rows}")
-    print(f"  B.H.18 rows added    : {h18_total}")
     if args.dry_run:
         print("\n  Dry run complete - run without --dry-run to apply.")
     else:
