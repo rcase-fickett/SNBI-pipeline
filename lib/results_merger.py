@@ -90,11 +90,12 @@ def merge_notes_result(conn, bridge_id, result, page_info):
         _write_evidence(conn, bridge_id, "B.RR.01", "R01",
                         rr["value"], "HIGH", source_tag, rr.get("reasoning"))
 
-    # Navigability clue
+    # Navigability clue from plans (only write HIGH — USCG permit reference found in drawings)
+    # APPROX pre-fill comes from 10_import_nav_waterways.py (USCG 13th District list).
     nav = result.get("navigability_clue", {})
     if isinstance(nav, dict) and nav.get("value"):
         _write_evidence(conn, bridge_id, "B.N.01", "W01",
-                        nav["value"], "APPROX", source_tag, nav.get("reasoning"))
+                        nav["value"], "HIGH", source_tag, nav.get("reasoning"))
 
     for evt in result.get("work_events", []):
         yr = evt.get("year")
