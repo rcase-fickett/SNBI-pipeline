@@ -299,6 +299,8 @@
                   color:#15803d;margin-bottom:.5rem;display:flex;align-items:center;gap:.5rem">
         <span style="background:#dcfce7;padding:2px 10px;border-radius:4px">Feature Items</span>
         {% if feature_rows %}<span style="color:#94a3b8;font-weight:400;font-size:11px">{{ feature_rows|length }} items</span>{% endif %}
+        <button class="btn btn-ghost btn-sm" onclick="openAddH18Modal()"
+                style="font-size:12px">+ Add Crossing Bridge</button>
         <button class="btn btn-ghost btn-sm" onclick="openAddFeatureModal()"
                 style="margin-left:auto;font-size:12px">+ Add Feature</button>
       </div>
@@ -414,6 +416,35 @@
         <button class="btn btn-ghost btn-sm" onclick="closeAddWorkModal()">Cancel</button>
         <button class="btn btn-sm" onclick="submitAddWork()"
                 style="background:#b45309;color:#fff">Add Work Record</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Crossing Bridge (B.H.18) Modal -->
+  <div id="add-h18-modal" style="display:none;position:fixed;inset:0;z-index:500;
+       background:rgba(0,0,0,.45);align-items:center;justify-content:center">
+    <div style="background:#fff;border-radius:10px;padding:1.5rem;min-width:320px;
+                max-width:420px;box-shadow:0 8px 32px rgba(0,0,0,.25)">
+      <div style="font-size:15px;font-weight:700;margin-bottom:.375rem">Add Crossing Bridge</div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:1rem">
+        Adds a B.H.18 row for a bridge that passes above or below this structure.
+      </div>
+      <div style="display:flex;flex-direction:column;gap:.875rem">
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#475569;display:block;margin-bottom:4px">Crossing Bridge ID</label>
+          <input id="h18-crossing-id" type="text" placeholder="e.g. 04234"
+                 style="width:100%;padding:7px 10px;border:1px solid #e2e8f0;
+                        border-radius:6px;font-size:13px;font-family:monospace;
+                        text-transform:uppercase">
+          <div style="font-size:11px;color:#94a3b8;margin-top:3px">
+            Enter the ODOT bridge file number of the crossing structure.
+          </div>
+        </div>
+        <div id="h18-error" style="color:#dc2626;font-size:12px;display:none"></div>
+      </div>
+      <div style="display:flex;gap:.5rem;justify-content:flex-end;margin-top:1.25rem">
+        <button class="btn btn-ghost btn-sm" onclick="closeAddH18Modal()">Cancel</button>
+        <button class="btn btn-primary btn-sm" onclick="submitAddH18()">Add Crossing Bridge</button>
       </div>
     </div>
   </div>
@@ -926,6 +957,44 @@ document.getElementById('work-year').addEventListener('keydown', function(e) {
   if (e.key === 'Enter') submitAddWork();
 });
 
+// ── Add Crossing Bridge (B.H.18) modal ───────────────────────
+function openAddH18Modal() {
+  const modal = document.getElementById('add-h18-modal');
+  modal.style.display = 'flex';
+  document.getElementById('h18-error').style.display = 'none';
+  document.getElementById('h18-crossing-id').value = '';
+  document.getElementById('h18-crossing-id').focus();
+}
+function closeAddH18Modal() {
+  document.getElementById('add-h18-modal').style.display = 'none';
+}
+async function submitAddH18() {
+  const crossingId = document.getElementById('h18-crossing-id').value.trim().toUpperCase();
+  const errEl      = document.getElementById('h18-error');
+  if (!crossingId) { errEl.textContent = 'Enter a crossing bridge ID.'; errEl.style.display = 'block'; return; }
+  errEl.style.display = 'none';
+  const res  = await fetch(`/api/bridge/${encodeURIComponent(BRIDGE)}/add-h18`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({crossing_id: crossingId})
+  });
+  const data = await res.json();
+  if (data.ok) {
+    toast(`Added crossing bridge ${data.feature_id}`);
+    closeAddH18Modal();
+    setTimeout(() => window.location.reload(), 700);
+  } else {
+    errEl.textContent = data.error || 'Failed to add crossing bridge.';
+    errEl.style.display = 'block';
+  }
+}
+document.getElementById('add-h18-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeAddH18Modal();
+});
+document.getElementById('h18-crossing-id').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') submitAddH18();
+});
+
 // ── Screenshots ───────────────────────────────────────────────
 async function uploadScreenshot(evidenceId, input) {
   const file = input.files[0];
@@ -990,3 +1059,12 @@ function addShotThumb(evidenceId, shot) {
 })();
 </script>
 {% endblock %}
+<html xmlns:mso="urn:schemas-microsoft-com:office:office" xmlns:msdt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882"><head>
+<!--[if gte mso 9]><xml>
+<mso:CustomDocumentProperties>
+<mso:MediaServiceImageTags msdt:dt="string"></mso:MediaServiceImageTags>
+<mso:lcf76f155ced4ddcb4097134ff3c332f msdt:dt="string"></mso:lcf76f155ced4ddcb4097134ff3c332f>
+<mso:TaxCatchAll msdt:dt="string"></mso:TaxCatchAll>
+</mso:CustomDocumentProperties>
+</xml><![endif]-->
+</head>
