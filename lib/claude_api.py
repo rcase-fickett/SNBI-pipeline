@@ -178,7 +178,7 @@ Return JSON:
 }
 
 Notes:
-- Look for USCG permit references (indicates navigable waterway → B.N.01=Y).
+- Look for explicit USCG permit references (permit number, "navigable waterway" language, bridge permit stamp). If found, set navigability_clue=Y — this becomes a HIGH override of the Phase 10 APPROX pre-fill. Do NOT guess from waterway size alone.
 - Railroad service type: F=freight, P=passenger, M=multiple, I=inactive.
 - design_load: HS20, HS25, HL-93, etc.
 - design_method: ASD, LFD, LRFD.
