@@ -329,18 +329,47 @@ def seed_features(conn, bridge_id, features, dry_run):
 
 def seed_h18_crossings(conn, bridge_id, lat, lon, dry_run):
     """
-    Seed B.H.18 (Crossing Bridge Number) for each bridge detected within 100m.
-    feature_id = crossing bridge ID; plan_value = crossing bridge ID.
-    Uses INSERT OR IGNORE — safe to re-run.
-    Returns count of rows inserted.
+    Seed B.H.18 (Crossing Bridge Number) for every bridge — required item on all structures.
+
+    If crossing bridges are detected within 200m: seed one row per crossing bridge
+      (feature_id = crossing bridge ID, plan_value = crossing bridge ID, APPROX).
+    If none detected and no B.H.18 rows exist yet: seed one blank PENDING row
+      (feature_id = 'NONE', plan_value = None) with reasoning noting no crossing detected.
+
+    Uses INSERT OR IGNORE — safe to re-run. Returns count of rows inserted.
     """
     nearby = find_nearby_bridges(bridge_id, lat, lon, radius_m=200)
     inserted = 0
-    for nb in nearby:
-        crossing_id = nb["bridge_id"]
-        if not crossing_id:
-            continue
-        inserted += _insert_row(conn, bridge_id, "B.H.18", crossing_id, crossing_id, "APPROX", dry_run)
+
+    if nearby:
+        for nb in nearby:
+            crossing_id = nb["bridge_id"]
+            if not crossing_id:
+                continue
+            inserted += _insert_row(conn, bridge_id, "B.H.18", crossing_id, crossing_id, "APPROX", dry_run)
+    else:
+        # Only seed the no-crossing placeholder if no B.H.18 rows exist at all for this bridge
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM evidence WHERE bridge_id=? AND item_id='B.H.18'",
+            (bridge_id,)
+        ).fetchone()[0]
+        if not existing:
+            item = ITEM_BY_ID.get("B.H.18", {})
+            if not dry_run:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO evidence "
+                    "(bridge_id, item_id, feature_id, item_name, plan_value, "
+                    "plan_confidence, plan_reasoning, brm_source_col, status) "
+                    "VALUES (?,?,?,?,?,?,?,?,'PENDING')",
+                    (bridge_id, "B.H.18", "NONE",
+                     item.get("name", "B.H.18"), None, "PENDING",
+                     "No crossing bridge detected within 200m",
+                     SOURCE),
+                )
+                inserted = cur.rowcount
+            else:
+                inserted = 1
+
     return inserted
 
 
