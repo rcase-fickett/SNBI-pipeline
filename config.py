@@ -60,7 +60,8 @@ SKIP_COMPLETED    = True         # Skip bridges already in DB with PLANS_DONE st
 BRIDGE_FILTER = None
 
 # ----------------------------------------------------------
-# 8. Column name in Bridge_List.xlsx that flags target bridges
+# 8. (Legacy — no longer used for filtering)
+#    Bridge_List.xlsx filter settings kept for reference only.
 # ----------------------------------------------------------
 COMPLETE_COL    = "Complete"
 COMPLETE_VALUE  = "Completed via script with pdf"

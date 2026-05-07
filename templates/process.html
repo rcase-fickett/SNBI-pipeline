@@ -13,31 +13,34 @@
 
       <!-- Status filter tabs -->
       <div style="display:flex;gap:.375rem;margin-bottom:.875rem;flex-wrap:wrap">
-        <a href="/process" class="btn btn-sm {% if not status_filter %}btn-primary{% else %}btn-ghost{% endif %}">
-          All
-        </a>
+        <button onclick="setStatus('')"
+                id="tab-all" class="btn btn-sm btn-primary">All</button>
         {% for row in status_counts %}
-        <a href="/process?status={{ row.processing_status }}"
-           class="btn btn-sm {% if status_filter == row.processing_status %}btn-primary{% else %}btn-ghost{% endif %}">
+        <button onclick="setStatus('{{ row.processing_status }}')"
+                id="tab-{{ row.processing_status }}"
+                class="btn btn-sm btn-ghost">
           {{ row.processing_status }} <span style="opacity:.7">({{ row.n }})</span>
-        </a>
+        </button>
         {% endfor %}
       </div>
 
       <!-- Search + selection controls -->
       <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.625rem;flex-wrap:wrap">
-        <input id="bridge-search" type="text" placeholder="Search bridge ID or name…"
-               oninput="filterTable()"
+        <input id="bridge-search" type="text" placeholder="Search bridge ID, name, or county…"
+               oninput="onSearch()"
                style="flex:1;min-width:200px;padding:5px 10px;border:1px solid #e2e8f0;
                       border-radius:6px;font-size:13px;font-family:monospace">
-        <button class="btn btn-ghost btn-sm" onclick="selectByStatus('BRM_DONE')">Select Unprocessed</button>
-        <button class="btn btn-ghost btn-sm" onclick="selectByStatus('ERROR')">Select Errors</button>
+        <button class="btn btn-ghost btn-sm" onclick="selectAllStatus('BRM_DONE')">Select Unprocessed</button>
+        <button class="btn btn-ghost btn-sm" onclick="selectAllStatus('ERROR')">Select Errors</button>
         <button class="btn btn-ghost btn-sm" onclick="clearSel()">Clear</button>
         <span id="sel-count" style="font-size:12px;color:#64748b;margin-left:.25rem"></span>
       </div>
 
+      <!-- Result count -->
+      <div id="result-info" style="font-size:12px;color:#94a3b8;margin-bottom:.375rem"></div>
+
       <!-- Bridge table -->
-      <div class="table-wrap" style="max-height:calc(100vh - 320px);overflow-y:auto">
+      <div class="table-wrap" style="max-height:calc(100vh - 340px);overflow-y:auto">
         <table>
           <thead>
             <tr>
@@ -49,37 +52,12 @@
               <th>Last Updated</th>
             </tr>
           </thead>
-          <tbody>
-            {% for b in bridges %}
-            <tr data-id="{{ b.bridge_id }}" data-status="{{ b.processing_status }}">
-              <td><input type="checkbox" class="bc" data-id="{{ b.bridge_id }}" onchange="onCheck(this)"></td>
-              <td>
-                <a href="/bridge/{{ b.bridge_id }}"
-                   style="color:#2563eb;font-weight:600;font-family:monospace;text-decoration:none">
-                  {{ b.bridge_id }}</a>
-              </td>
-              <td style="font-size:12px">{{ b.bridge_name or '—' }}</td>
-              <td style="font-size:12px;color:#64748b">{{ b.county or '—' }}</td>
-              <td>
-                {% set sc = {
-                  'PENDING':    'badge-PENDING',
-                  'BRM_DONE':   'badge-APPROX',
-                  'PLANS_DONE': 'badge-HIGH',
-                  'ERROR':      'badge-FIELD_REQ',
-                  'COMPLETE':   'badge-HIGH'
-                } %}
-                <span class="badge {{ sc.get(b.processing_status, 'badge-PENDING') }}">
-                  {{ b.processing_status }}
-                </span>
-              </td>
-              <td style="font-size:11px;color:#94a3b8">
-                {{ b.updated_at[:10] if b.updated_at else '—' }}
+          <tbody id="bridge-tbody">
+            <tr id="placeholder-row">
+              <td colspan="6" style="text-align:center;padding:2rem;color:#94a3b8">
+                Search above or click a status filter to find bridges.
               </td>
             </tr>
-            {% endfor %}
-            {% if not bridges %}
-            <tr><td colspan="6" style="text-align:center;padding:2rem;color:#94a3b8">No bridges found.</td></tr>
-            {% endif %}
           </tbody>
         </table>
       </div>
@@ -197,21 +175,106 @@
 {% block scripts %}
 <script>
 let polling = null;
+let _activeStatus = '';
+let _searchTimer  = null;
+// IDs selected from "Select All" API calls (may exceed visible rows)
+let _extraSelected = new Set();
 
-// Search filter
-function filterTable() {
-  const q = document.getElementById('bridge-search').value.trim().toLowerCase();
-  document.querySelectorAll('tbody tr[data-id]').forEach(tr => {
-    const id   = (tr.dataset.id   || '').toLowerCase();
-    const name = (tr.querySelector('td:nth-child(3)')?.textContent || '').toLowerCase();
-    tr.style.display = (!q || id.includes(q) || name.includes(q)) ? '' : 'none';
+const STATUS_BADGE = {
+  PENDING:    'badge-PENDING',
+  BRM_DONE:   'badge-APPROX',
+  PLANS_DONE: 'badge-HIGH',
+  ERROR:      'badge-FIELD_REQ',
+  COMPLETE:   'badge-HIGH',
+  REVIEW_DONE:'badge-HIGH',
+};
+
+// ── Status tab switching ──────────────────────────────────────
+function setStatus(status) {
+  _activeStatus = status;
+  document.querySelectorAll('[id^="tab-"]').forEach(btn => {
+    const isActive = (btn.id === 'tab-' + (status || 'all'));
+    btn.classList.toggle('btn-primary', isActive);
+    btn.classList.toggle('btn-ghost',  !isActive);
+  });
+  fetchBridges();
+}
+
+// ── Search (debounced) ────────────────────────────────────────
+function onSearch() {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(fetchBridges, 250);
+}
+
+// ── AJAX fetch ────────────────────────────────────────────────
+async function fetchBridges() {
+  const q = document.getElementById('bridge-search').value.trim();
+  if (!q && !_activeStatus) {
+    renderRows([]);
+    document.getElementById('result-info').textContent = '';
+    document.getElementById('placeholder-row').style.display = '';
+    return;
+  }
+  document.getElementById('placeholder-row').style.display = 'none';
+  const params = new URLSearchParams();
+  if (q)             params.set('q',      q);
+  if (_activeStatus) params.set('status', _activeStatus);
+  params.set('limit', '100');
+  const data = await fetch('/api/bridges?' + params).then(r => r.json());
+  renderRows(data.bridges);
+  const info = document.getElementById('result-info');
+  if (data.total === 0) {
+    info.textContent = 'No bridges found.';
+  } else if (data.showing < data.total) {
+    info.textContent = `Showing ${data.showing} of ${data.total} — refine your search to see more.`;
+  } else {
+    info.textContent = `${data.total} bridge${data.total !== 1 ? 's' : ''}`;
+  }
+}
+
+function renderRows(bridges) {
+  const tbody = document.getElementById('bridge-tbody');
+  // Preserve placeholder row, clear data rows
+  const placeholder = document.getElementById('placeholder-row');
+  tbody.innerHTML = '';
+  tbody.appendChild(placeholder);
+  placeholder.style.display = 'none';
+
+  if (!bridges.length) {
+    placeholder.style.display = '';
+    placeholder.querySelector('td').textContent =
+      (_activeStatus || document.getElementById('bridge-search').value.trim())
+        ? 'No bridges match.' : 'Search above or click a status filter to find bridges.';
+    return;
+  }
+
+  bridges.forEach(b => {
+    const isChecked = _extraSelected.has(b.bridge_id);
+    const badgeCls  = STATUS_BADGE[b.processing_status] || 'badge-PENDING';
+    const updated   = b.updated_at ? b.updated_at.slice(0, 10) : '—';
+    const tr = document.createElement('tr');
+    tr.dataset.id     = b.bridge_id;
+    tr.dataset.status = b.processing_status;
+    if (isChecked) tr.classList.add('selected');
+    tr.innerHTML = `
+      <td><input type="checkbox" class="bc" data-id="${b.bridge_id}"
+                 onchange="onCheck(this)" ${isChecked ? 'checked' : ''}></td>
+      <td><a href="/bridge/${b.bridge_id}"
+             style="color:#2563eb;font-weight:600;font-family:monospace;text-decoration:none"
+             >${b.bridge_id}</a></td>
+      <td style="font-size:12px">${b.bridge_name || '—'}</td>
+      <td style="font-size:12px;color:#64748b">${b.county || '—'}</td>
+      <td><span class="badge ${badgeCls}">${b.processing_status}</span></td>
+      <td style="font-size:11px;color:#94a3b8">${updated}</td>`;
+    tbody.appendChild(tr);
   });
   updateCount();
 }
 
-// Selection
+// ── Selection ─────────────────────────────────────────────────
 function getSelected() {
-  return [...document.querySelectorAll('.bc:checked')].map(cb => cb.dataset.id);
+  const visible = [...document.querySelectorAll('.bc:checked')].map(cb => cb.dataset.id);
+  return [...new Set([...visible, ..._extraSelected])];
 }
 function updateCount() {
   const n = getSelected().length;
@@ -221,22 +284,32 @@ function toggleAll(master) {
   document.querySelectorAll('.bc').forEach(cb => {
     cb.checked = master.checked;
     cb.closest('tr').classList.toggle('selected', master.checked);
+    if (master.checked) _extraSelected.add(cb.dataset.id);
+    else                _extraSelected.delete(cb.dataset.id);
   });
   updateCount();
 }
 function onCheck(cb) {
   cb.closest('tr').classList.toggle('selected', cb.checked);
+  if (cb.checked) _extraSelected.add(cb.dataset.id);
+  else            _extraSelected.delete(cb.dataset.id);
   updateCount();
 }
-function selectByStatus(status) {
+async function selectAllStatus(status) {
+  const data = await fetch(`/api/bridge-ids?status=${encodeURIComponent(status)}`).then(r => r.json());
+  data.ids.forEach(id => _extraSelected.add(id));
+  // Tick any currently visible rows that match
   document.querySelectorAll('.bc').forEach(cb => {
-    const isMatch = cb.closest('tr').dataset.status === status;
-    cb.checked = isMatch;
-    cb.closest('tr').classList.toggle('selected', isMatch);
+    if (_extraSelected.has(cb.dataset.id)) {
+      cb.checked = true;
+      cb.closest('tr').classList.add('selected');
+    }
   });
   updateCount();
+  toast(`${data.ids.length} ${status} bridges selected`);
 }
 function clearSel() {
+  _extraSelected.clear();
   document.querySelectorAll('.bc').forEach(cb => { cb.checked = false; cb.closest('tr').classList.remove('selected'); });
   document.getElementById('sel-all').checked = false;
   updateCount();

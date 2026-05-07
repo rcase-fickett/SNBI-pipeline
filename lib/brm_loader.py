@@ -17,24 +17,19 @@ except ImportError:
 
 def load_brm_data(conn, config):
     """
-    Main entry point. Reads both Excel files and populates bridges +
+    Main entry point. Reads BrM export and VC list, populates bridges +
     evidence tables with all available BrM values.
     """
     print("Loading Bridge_List_Export.xlsx ...")
     brm = pd.read_excel(config.BRM_EXPORT_PATH, dtype=str).fillna("")
 
-    print("Loading Bridge_List.xlsx ...")
-    bl  = pd.read_excel(config.BRIDGE_LIST_PATH,  dtype=str).fillna("")
-
     print("Loading Vertical_Clearance_List.xlsx ...")
     vc  = pd.read_excel(config.VC_LIST_PATH, dtype=str).fillna("")
 
-    # Build lookup sets
-    target_ids = set(
-        bl[bl[config.COMPLETE_COL] == config.COMPLETE_VALUE][config.BRIDGE_ID_COL].tolist()
-    )
-    vc_found = set(vc[vc["Found"] == "Found"]["Bridge List"].tolist())
+    # All bridges in the BrM export are targets
     brm_lookup = {row["BridgeID"]: row for _, row in brm.iterrows()}
+    target_ids = set(brm_lookup.keys())
+    vc_found   = set(vc[vc["Found"] == "Found"]["Bridge List"].tolist())
 
     if config.BRIDGE_FILTER:
         target_ids = target_ids & set(config.BRIDGE_FILTER)
@@ -144,7 +139,12 @@ def load_brm_data(conn, config):
                 "auto_questions":"Year must come from plans/revision block — not available in BrM export",
             })
 
-        set_bridge_status(conn, bridge_id, "BRM_DONE")
+        # Only advance to BRM_DONE if still at PENDING — don't overwrite PLANS_DONE / COMPLETE
+        conn.execute(
+            "UPDATE bridges SET processing_status='BRM_DONE', updated_at=datetime('now') "
+            "WHERE bridge_id=? AND processing_status='PENDING'",
+            (bridge_id,)
+        )
         log(conn, bridge_id, "BRM", "SUCCESS", f"Loaded {len(features)} features")
         processed += 1
         if processed % 50 == 0:

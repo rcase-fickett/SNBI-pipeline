@@ -183,6 +183,25 @@ def get_all_evidence(conn):
     ).fetchall()
 
 
+def get_below_features(conn, bridge_id, type_prefix=None):
+    """
+    Return feature_ids where B.F.02 = 'B' (below) for a bridge.
+    type_prefix: if given, restrict to feature IDs starting with that character
+                 (e.g. 'H' for highway, 'R' for railroad, 'W' for waterway).
+    Checks both brm_value and plan_value so plan overrides are respected.
+    """
+    rows = conn.execute(
+        """SELECT DISTINCT feature_id FROM evidence
+           WHERE bridge_id=? AND item_id='B.F.02'
+             AND (brm_value='B' OR plan_value='B')""",
+        (bridge_id,)
+    ).fetchall()
+    fids = [r[0] for r in rows]
+    if type_prefix:
+        fids = [f for f in fids if f.startswith(type_prefix)]
+    return fids
+
+
 # ── Logging ────────────────────────────────────────────────────────────────
 
 def log(conn, bridge_id, phase, status, message=""):
@@ -306,6 +325,55 @@ def migrate_db(db_path):
     );
     CREATE INDEX IF NOT EXISTS idx_screenshots_evidence ON screenshots(evidence_id);
     """)
+
+    # Bridge log table — raw entry text from brlog.pdf, populated by 07_import_bridge_log.py
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS bridge_log (
+        bridge_id   TEXT PRIMARY KEY,
+        raw_entry   TEXT NOT NULL,
+        imported_at TEXT DEFAULT (datetime('now'))
+    );
+    """)
+
+    # Features table — one row per feature (H01, W01, R01, etc.) with SNBI-format UUID
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS features (
+        id           TEXT PRIMARY KEY,
+        bridge_id    TEXT NOT NULL,
+        designation  TEXT NOT NULL,
+        feature_type TEXT NOT NULL,
+        location     TEXT,
+        created_at   TEXT DEFAULT (datetime('now')),
+        UNIQUE(bridge_id, designation),
+        FOREIGN KEY (bridge_id) REFERENCES bridges(bridge_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_features_bridge ON features(bridge_id);
+    """)
+
+    # Populate features from existing evidence rows (migration for existing DBs).
+    # One bulk query to find gaps, then batch-insert — avoids N+1 queries.
+    import uuid as _uuid
+    already_set = set(
+        (r["bridge_id"], r["designation"])
+        for r in conn.execute("SELECT bridge_id, designation FROM features").fetchall()
+    )
+    candidates = conn.execute("""
+        SELECT DISTINCT e.bridge_id, e.feature_id,
+               MAX(CASE WHEN e.item_id='B.F.02' THEN COALESCE(e.plan_value, e.brm_value) END) AS location
+        FROM evidence e
+        WHERE e.feature_id != 'PRIMARY' AND e.feature_id NOT LIKE 'WORK:%'
+        GROUP BY e.bridge_id, e.feature_id
+    """).fetchall()
+    for row in candidates:
+        bid, fid = row["bridge_id"], row["feature_id"]
+        if (bid, fid) in already_set:
+            continue
+        location = (row["location"] or "").strip() or None
+        new_uuid = _uuid.uuid4().hex[:8].upper()
+        conn.execute(
+            "INSERT OR IGNORE INTO features (id, bridge_id, designation, feature_type, location) VALUES (?,?,?,?,?)",
+            (new_uuid, bid, fid, fid[0].upper(), location)
+        )
 
     conn.commit()
     conn.close()

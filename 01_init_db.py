@@ -32,7 +32,6 @@ def main():
     # Validate input files exist
     for label, path in [
         ("BrM export",     config.BRM_EXPORT_PATH),
-        ("Bridge list",    config.BRIDGE_LIST_PATH),
         ("VC list",        config.VC_LIST_PATH),
     ]:
         if not os.path.exists(path):
