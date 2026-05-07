@@ -394,6 +394,26 @@ def get_bridge_carries_crosses(bridge_id):
     return (a.get("CARRIES") or "").strip(), (a.get("CROSSES") or "").strip()
 
 
+def find_nearby_bridges(bridge_id, lat, lon, radius_m=200):
+    """
+    Query ODOT layer 101 for bridges within radius_m meters of (lat, lon).
+    Excludes the current bridge_id.
+    Returns list of {"bridge_id": ..., "carries": ..., "crosses": ...} dicts.
+    """
+    feats = _query_layer(101, lat, lon, radius_m, "BRIDGE_ID,CARRIES,CROSSES")
+    result = []
+    for feat in feats:
+        a   = feat.get("attributes", {})
+        bid = (a.get("BRIDGE_ID") or "").strip()
+        if bid and bid != bridge_id:
+            result.append({
+                "bridge_id": bid,
+                "carries":   (a.get("CARRIES") or "").strip(),
+                "crosses":   (a.get("CROSSES") or "").strip(),
+            })
+    return result
+
+
 def _query_osm_all_features(lat, lon, radius_m=150):
     """
     Query OSM Overpass for highway, railway, and waterway ways near a bridge.

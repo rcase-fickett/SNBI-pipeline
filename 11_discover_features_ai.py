@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import DB_PATH, ANTHROPIC_API_KEY, CLAUDE_MODEL, BATCH_DELAY_SEC
 from lib.db import get_conn
-from lib.geo_context import gather_feature_context
+from lib.geo_context import gather_feature_context, find_nearby_bridges
 from lib.snbi_items import ITEM_BY_ID
 
 SOURCE = "ODOT TransGIS + OSM (11_discover_features_ai)"
@@ -64,7 +64,7 @@ SYSTEM_PROMPT = (
 
 # Items seeded as PENDING (null plan_value) for each feature type — filled by Phase 2 / inspector
 _TYPE_ITEMS = {
-    "H": ("B.H.08", "B.H.12", "B.H.13", "B.H.14", "B.H.15", "B.H.16", "B.H.18"),
+    "H": ("B.H.08", "B.H.12", "B.H.13", "B.H.14", "B.H.15", "B.H.16"),
     "R": ("B.RR.01", "B.RR.02", "B.RR.03"),
     "W": ("B.N.01", "B.N.02", "B.N.03", "B.N.04", "B.N.05", "B.N.06"),
 }
@@ -327,6 +327,155 @@ def seed_features(conn, bridge_id, features, dry_run):
     return inserted
 
 
+def seed_h18_crossings(conn, bridge_id, lat, lon, dry_run):
+    """
+    Seed B.H.18 (Crossing Bridge Number) for each bridge detected within 100m.
+    feature_id = crossing bridge ID; plan_value = crossing bridge ID.
+    Uses INSERT OR IGNORE — safe to re-run.
+    Returns count of rows inserted.
+    """
+    nearby = find_nearby_bridges(bridge_id, lat, lon, radius_m=200)
+    inserted = 0
+    for nb in nearby:
+        crossing_id = nb["bridge_id"]
+        if not crossing_id:
+            continue
+        inserted += _insert_row(conn, bridge_id, "B.H.18", crossing_id, crossing_id, "APPROX", dry_run)
+    return inserted
+
+
+def run_backfill(args):
+    """
+    Backfill type-specific PENDING rows for H*/R*/W* features that were seeded
+    before Phase 11 (e.g. by Phase 9 or Phase 1 BrM import) and are missing items
+    like B.H.08, B.H.16, B.RR.02, B.RR.03, B.N.02-06.
+    Also cleans up B.H.18 rows incorrectly seeded per H*/R*/W* feature_id and
+    re-seeds B.H.18 via proximity detection (feature_id = crossing bridge ID).
+    Uses INSERT OR IGNORE — never overwrites existing rows.
+    """
+    conn = get_conn(DB_PATH)
+
+    print("=" * 60)
+    print("  Phase 11: Type-Specific Item Backfill + B.H.18 Re-seed")
+    print("=" * 60)
+    if args.dry_run:
+        print("  DRY RUN - no changes written\n")
+
+    # ── Step 1: Clean up B.H.18 rows incorrectly keyed to H*/R*/W*/P* feature_ids ──
+    # Correct feature_ids for B.H.18 are numeric bridge IDs (e.g. "02682").
+    # Wrong ones start with a letter (H01, H02, R01, W01, P01, etc.).
+    wrong_count = conn.execute(
+        "SELECT COUNT(*) FROM evidence "
+        "WHERE item_id='B.H.18' AND feature_id GLOB '[A-Z]*'"
+    ).fetchone()[0]
+
+    if wrong_count:
+        print(f"  Removing {wrong_count} B.H.18 row(s) incorrectly keyed to feature_ids...")
+        if not args.dry_run:
+            conn.execute(
+                "DELETE FROM evidence WHERE item_id='B.H.18' AND feature_id GLOB '[A-Z]*'"
+            )
+            conn.commit()
+    else:
+        print("  No incorrectly-keyed B.H.18 rows found.")
+
+    # ── Step 2: Type-specific item backfill ──────────────────────────────────────
+    candidates = conn.execute("""
+        SELECT DISTINCT e.bridge_id, e.feature_id,
+               COALESCE(
+                   MAX(CASE WHEN e.item_id='B.F.02' THEN e.plan_value END),
+                   MAX(CASE WHEN e.item_id='B.F.02' THEN e.brm_value END)
+               ) AS loc
+        FROM evidence e
+        WHERE e.feature_id NOT IN ('PRIMARY')
+          AND e.feature_id NOT LIKE 'WORK:%'
+          AND SUBSTR(e.feature_id, 1, 1) IN ('H', 'R', 'W')
+        GROUP BY e.bridge_id, e.feature_id
+        ORDER BY e.bridge_id, e.feature_id
+    """).fetchall()
+
+    if args.bridge:
+        candidates = [r for r in candidates if r["bridge_id"] == args.bridge]
+
+    print(f"  Features to check  : {len(candidates)}")
+
+    features_updated = type_rows = 0
+
+    for row in candidates:
+        bridge_id = row["bridge_id"]
+        fid       = row["feature_id"]
+        loc       = (row["loc"] or "").strip().upper()
+        ftype     = fid[0]
+
+        existing_items = set(r[0] for r in conn.execute(
+            "SELECT item_id FROM evidence WHERE bridge_id=? AND feature_id=?",
+            (bridge_id, fid)
+        ).fetchall())
+
+        inserted = 0
+        for item_id in _TYPE_ITEMS.get(ftype, ()):
+            if item_id in existing_items:
+                continue
+            if ftype == "H" and loc == "C" and item_id in _CARRIED_H_PREFILLS:
+                val, confidence = _CARRIED_H_PREFILLS[item_id], "APPROX"
+            else:
+                val, confidence = None, "PENDING"
+            inserted += _insert_row(conn, bridge_id, item_id, fid, val, confidence, args.dry_run)
+
+        if inserted:
+            features_updated += 1
+            type_rows        += inserted
+            label = "[DRY RUN] " if args.dry_run else ""
+            if args.verbose or args.bridge:
+                print(f"  {label}[{bridge_id}] {fid}: +{inserted} row(s)")
+
+    if not args.dry_run:
+        conn.commit()
+
+    # ── Step 3: B.H.18 proximity seeding ─────────────────────────────────────────
+    bridge_rows = conn.execute(
+        "SELECT bridge_id, lat, lon FROM bridges WHERE lat IS NOT NULL AND lon IS NOT NULL"
+        + (" AND bridge_id=?" if args.bridge else "")
+        + " ORDER BY bridge_id",
+        (args.bridge,) if args.bridge else ()
+    ).fetchall()
+
+    print(f"  Bridges for B.H.18 : {len(bridge_rows)} (have coordinates)")
+
+    h18_bridges = h18_rows = 0
+    import time as _time
+
+    for br in bridge_rows:
+        bid = br["bridge_id"]
+        try:
+            lat, lon = float(br["lat"]), float(br["lon"])
+        except (ValueError, TypeError):
+            continue
+
+        n = seed_h18_crossings(conn, bid, lat, lon, args.dry_run)
+        if n:
+            h18_bridges += 1
+            h18_rows    += n
+            label = "[DRY RUN] " if args.dry_run else ""
+            if args.verbose or args.bridge:
+                print(f"  {label}[{bid}] B.H.18: +{n} crossing bridge(s)")
+        _time.sleep(0.2)  # courtesy delay for ODOT GIS server
+
+    if not args.dry_run:
+        conn.commit()
+    conn.close()
+
+    print(f"\n  B.H.18 rows removed  : {wrong_count}")
+    print(f"  Features updated     : {features_updated}")
+    print(f"  Type-item rows added : {type_rows}")
+    print(f"  Bridges w/ B.H.18    : {h18_bridges}")
+    print(f"  B.H.18 rows added    : {h18_rows}")
+    if args.dry_run:
+        print("\n  Dry run complete - run without --dry-run to apply.")
+    else:
+        print("\n  Backfill complete.")
+
+
 def run(args):
     api_key = ANTHROPIC_API_KEY or os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -362,7 +511,7 @@ def run(args):
     if args.dry_run:
         print("  DRY RUN - no changes written\n")
 
-    no_coords = skipped = bridges_updated = total_rows = 0
+    no_coords = skipped = bridges_updated = total_rows = h18_total = 0
 
     for bridge_row in rows:
         bridge_id = bridge_row["bridge_id"]
@@ -396,20 +545,25 @@ def run(args):
             skipped += 1
             if args.verbose:
                 print(f"  [{bridge_id}] Claude returned no new features")
-            continue
-
-        n = seed_features(conn, bridge_id, features, args.dry_run)
-
-        if n:
-            bridges_updated += 1
-            total_rows      += n
-            label = "[DRY RUN] " if args.dry_run else ""
-            print(f"  {label}[{bridge_id}] +{len(features)} feature(s), {n} row(s) inserted:")
-            for f in features:
-                print(f"    {f.get('feature_id')} ({f.get('location')}) {f.get('name')}")
         else:
-            if args.verbose:
-                print(f"  [{bridge_id}] All returned features already exist")
+            n = seed_features(conn, bridge_id, features, args.dry_run)
+
+            if n:
+                bridges_updated += 1
+                total_rows      += n
+                label = "[DRY RUN] " if args.dry_run else ""
+                print(f"  {label}[{bridge_id}] +{len(features)} feature(s), {n} row(s) inserted:")
+                for f in features:
+                    print(f"    {f.get('feature_id')} ({f.get('location')}) {f.get('name')}")
+            else:
+                if args.verbose:
+                    print(f"  [{bridge_id}] All returned features already exist")
+
+        # B.H.18 — proximity-based crossing bridge detection (no API call)
+        n_h18 = seed_h18_crossings(conn, bridge_id, lat, lon, args.dry_run)
+        h18_total += n_h18
+        if n_h18 and args.verbose:
+            print(f"  [{bridge_id}] B.H.18: +{n_h18} crossing bridge(s)")
 
     if not args.dry_run:
         conn.commit()
@@ -420,6 +574,7 @@ def run(args):
     print(f"  Nothing new to add   : {skipped}")
     print(f"  Bridges updated      : {bridges_updated}")
     print(f"  Evidence rows added  : {total_rows}")
+    print(f"  B.H.18 rows added    : {h18_total}")
     if args.dry_run:
         print("\n  Dry run complete - run without --dry-run to apply.")
     else:
@@ -443,8 +598,15 @@ def main():
                         help="Print details for all bridges including no-change ones")
     parser.add_argument("--debug",    action="store_true",
                         help="Print full prompt and raw Claude response for each bridge")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Backfill missing type-specific items (B.H.08/16, B.RR.02/03, "
+                             "B.N.02-06) for existing H*/R*/W* features; fix B.H.18 keying; "
+                             "re-seed B.H.18 via proximity detection")
     args = parser.parse_args()
-    run(args)
+    if args.backfill:
+        run_backfill(args)
+    else:
+        run(args)
 
 
 if __name__ == "__main__":
