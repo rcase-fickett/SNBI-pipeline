@@ -689,40 +689,6 @@ def delete_feature_group(bridge_id, feature_id):
     return jsonify({"ok": True})
 
 
-# ── API: add a B.H.18 crossing bridge row manually ───────────────────────────
-
-@app.route("/api/bridge/<bridge_id>/add-h18", methods=["POST"])
-def add_h18_crossing(bridge_id):
-    data        = request.get_json() or {}
-    crossing_id = str(data.get("crossing_id", "")).strip().upper()
-    if not crossing_id:
-        return jsonify({"ok": False, "error": "Crossing bridge ID is required"}), 400
-
-    from lib.snbi_items import ITEM_BY_ID
-    item = ITEM_BY_ID.get("B.H.18", {})
-
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id FROM evidence WHERE bridge_id=? AND item_id='B.H.18' AND feature_id=?",
-        (bridge_id, crossing_id)
-    ).fetchone()
-    if existing:
-        conn.close()
-        return jsonify({"ok": False, "error": f"B.H.18 row for {crossing_id} already exists"}), 409
-
-    cur = conn.execute(
-        "INSERT INTO evidence (bridge_id, item_id, feature_id, item_name, plan_value, "
-        "plan_confidence, brm_source_col, status) VALUES (?,?,?,?,?,?,?,'PENDING')",
-        (bridge_id, "B.H.18", crossing_id,
-         item.get("name", "Crossing Bridge Number"),
-         crossing_id, "APPROX", "Manual entry")
-    )
-    new_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "id": new_id, "feature_id": crossing_id})
-
-
 # ── API: add a new feature to a bridge ───────────────────────────────────────
 
 @app.route("/api/bridge/<bridge_id>/add-feature", methods=["POST"])
