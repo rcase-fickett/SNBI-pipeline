@@ -364,16 +364,19 @@ def run_backfill(args):
     # ── Step 1: Clean up B.H.18 rows incorrectly keyed to H*/R*/W*/P* feature_ids ──
     # Correct feature_ids for B.H.18 are numeric bridge IDs (e.g. "02682").
     # Wrong ones start with a letter (H01, H02, R01, W01, P01, etc.).
+    # SNBI feature codes are 1 letter + 2 digits (H01, H02, R01, W01, P01...) — max 4 chars.
+    # Legitimate ODOT crossing bridge IDs like R7040A, N8588E are 5-6+ chars. Use LENGTH <=4.
     wrong_count = conn.execute(
         "SELECT COUNT(*) FROM evidence "
-        "WHERE item_id='B.H.18' AND feature_id GLOB '[A-Z]*'"
+        "WHERE item_id='B.H.18' AND LENGTH(feature_id) <= 4 AND feature_id GLOB '[A-Z][0-9]*'"
     ).fetchone()[0]
 
     if wrong_count:
         print(f"  Removing {wrong_count} B.H.18 row(s) incorrectly keyed to feature_ids...")
         if not args.dry_run:
             conn.execute(
-                "DELETE FROM evidence WHERE item_id='B.H.18' AND feature_id GLOB '[A-Z]*'"
+                "DELETE FROM evidence WHERE item_id='B.H.18' "
+                "AND LENGTH(feature_id) <= 4 AND feature_id GLOB '[A-Z][0-9]*'"
             )
             conn.commit()
     else:
