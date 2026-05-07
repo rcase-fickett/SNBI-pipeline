@@ -327,18 +327,36 @@ def seed_features(conn, bridge_id, features, dry_run):
     return inserted
 
 
-def seed_h18_crossings(conn, bridge_id, lat, lon, dry_run):
+def _h18_radius(bridge_length_ft):
+    """
+    Compute B.H.18 proximity search radius from bridge length.
+    A crossing bridge can be at most bridge_length/2 from the centroid, so
+    radius = max(50m, min(length_ft * 0.3048 / 2, 400m)).
+    Falls back to 200m if length is unknown.
+    """
+    try:
+        metres = float(bridge_length_ft) * 0.3048 / 2
+        return max(50, min(int(metres), 400))
+    except (TypeError, ValueError):
+        return 200
+
+
+def seed_h18_crossings(conn, bridge_id, lat, lon, dry_run, bridge_length_ft=None):
     """
     Seed B.H.18 (Crossing Bridge Number) for every bridge — required item on all structures.
 
-    If crossing bridges are detected within 200m: seed one row per crossing bridge
+    Search radius is scaled to bridge length (B.G.01): a 30 ft bridge searches 50m;
+    a 1,000 ft bridge searches ~150m; capped at 400m. Falls back to 200m if unknown.
+
+    If crossing bridges are detected: seed one row per crossing bridge
       (feature_id = crossing bridge ID, plan_value = crossing bridge ID, APPROX).
     If none detected and no B.H.18 rows exist yet: seed one blank PENDING row
       (feature_id = 'NONE', plan_value = None) with reasoning noting no crossing detected.
 
     Uses INSERT OR IGNORE — safe to re-run. Returns count of rows inserted.
     """
-    nearby = find_nearby_bridges(bridge_id, lat, lon, radius_m=200)
+    radius_m = _h18_radius(bridge_length_ft)
+    nearby   = find_nearby_bridges(bridge_id, lat, lon, radius_m=radius_m)
     inserted = 0
 
     if nearby:
@@ -355,6 +373,8 @@ def seed_h18_crossings(conn, bridge_id, lat, lon, dry_run):
         ).fetchone()[0]
         if not existing:
             item = ITEM_BY_ID.get("B.H.18", {})
+            reason = (f"No crossing bridge detected within {radius_m}m"
+                      if bridge_length_ft else "No crossing bridge detected within 200m")
             if not dry_run:
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO evidence "
@@ -363,8 +383,7 @@ def seed_h18_crossings(conn, bridge_id, lat, lon, dry_run):
                     "VALUES (?,?,?,?,?,?,?,?,'PENDING')",
                     (bridge_id, "B.H.18", "NONE",
                      item.get("name", "B.H.18"), None, "PENDING",
-                     "No crossing bridge detected within 200m",
-                     SOURCE),
+                     reason, SOURCE),
                 )
                 inserted = cur.rowcount
             else:
@@ -466,9 +485,12 @@ def run_backfill(args):
 
     # ── Step 3: B.H.18 proximity seeding ─────────────────────────────────────────
     bridge_rows = conn.execute(
-        "SELECT bridge_id, lat, lon FROM bridges WHERE lat IS NOT NULL AND lon IS NOT NULL"
-        + (" AND bridge_id=?" if args.bridge else "")
-        + " ORDER BY bridge_id",
+        "SELECT b.bridge_id, b.lat, b.lon, e.brm_value AS length_ft "
+        "FROM bridges b "
+        "LEFT JOIN evidence e ON e.bridge_id=b.bridge_id AND e.item_id='B.G.01' "
+        "WHERE b.lat IS NOT NULL AND b.lon IS NOT NULL"
+        + (" AND b.bridge_id=?" if args.bridge else "")
+        + " ORDER BY b.bridge_id",
         (args.bridge,) if args.bridge else ()
     ).fetchall()
 
@@ -484,13 +506,15 @@ def run_backfill(args):
         except (ValueError, TypeError):
             continue
 
-        n = seed_h18_crossings(conn, bid, lat, lon, args.dry_run)
+        length_ft = float(br["length_ft"]) if br["length_ft"] else None
+        n = seed_h18_crossings(conn, bid, lat, lon, args.dry_run, length_ft)
         if n:
             h18_bridges += 1
             h18_rows    += n
             label = "[DRY RUN] " if args.dry_run else ""
             if args.verbose or args.bridge:
-                print(f"  {label}[{bid}] B.H.18: +{n} crossing bridge(s)")
+                radius = _h18_radius(length_ft)
+                print(f"  {label}[{bid}] B.H.18: +{n} row(s) (radius={radius}m)")
         _time.sleep(0.2)  # courtesy delay for ODOT GIS server
 
     if not args.dry_run:
@@ -592,10 +616,16 @@ def run(args):
                     print(f"  [{bridge_id}] All returned features already exist")
 
         # B.H.18 — proximity-based crossing bridge detection (no API call)
-        n_h18 = seed_h18_crossings(conn, bridge_id, lat, lon, args.dry_run)
+        length_row = conn.execute(
+            "SELECT brm_value FROM evidence WHERE bridge_id=? AND item_id='B.G.01' LIMIT 1",
+            (bridge_id,)
+        ).fetchone()
+        bridge_length_ft = float(length_row["brm_value"]) if length_row and length_row["brm_value"] else None
+        n_h18 = seed_h18_crossings(conn, bridge_id, lat, lon, args.dry_run, bridge_length_ft)
         h18_total += n_h18
         if n_h18 and args.verbose:
-            print(f"  [{bridge_id}] B.H.18: +{n_h18} crossing bridge(s)")
+            radius = _h18_radius(bridge_length_ft)
+            print(f"  [{bridge_id}] B.H.18: +{n_h18} row(s) (radius={radius}m, length={bridge_length_ft or '?'}ft)")
 
     if not args.dry_run:
         conn.commit()
