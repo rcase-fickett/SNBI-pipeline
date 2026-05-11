@@ -20,6 +20,7 @@ SNBI item mappings (DataCrosswalk Clean/Partial transitions):
   NBI 40   -> B.N.04 on W* below    (Navigation horizontal clearance)
   NBI 111  -> B.N.06 on W* below    (Pier/abutment protection)
   NBI 116  -> B.N.03 on W* below    (Lift bridge clearance when raised -- movable only)
+  struct_type -> B.N.03 = 999.9     (Bascule/swing/tilt/pivot/retractable -- unlimited clearance)
 
 Below features are resolved per bridge via get_below_features() using B.F.02='B', so
 divided-highway bridges (where H02 is a second carried feature) are handled correctly.
@@ -303,11 +304,54 @@ def main():
             # SNBI codes 0-1 also require a formal engineering assessment, not field obs.
             # Leave as PENDING for inspector determination.
 
+    # ── B.N.03: 999.9 for bascule/swing/tilt/pivot/retractable bridges ───────
+    # These bridge types provide unlimited clearance in the open position.
+    # Vertical lift bridges (Movable-Lift) are excluded — they have a specific
+    # raised clearance already sourced from NBI 116 above.
+    UNLIMITED_CLEARANCE_KEYWORDS = [
+        "bascule", "swing", "tilt", "thrust", "pivot", "retractable",
+    ]
+    unlimited_bridges = conn.execute("""
+        SELECT b.bridge_id, b.struct_type
+        FROM bridges b
+        JOIN evidence e ON e.bridge_id = b.bridge_id
+        WHERE e.item_id = 'B.N.03'
+          AND e.brm_value IS NULL
+    """).fetchall()
+
+    unlimited_count = 0
+    for brow in unlimited_bridges:
+        st = (brow["struct_type"] or "").lower()
+        if any(kw in st for kw in UNLIMITED_CLEARANCE_KEYWORDS):
+            reasoning = (
+                f"Bridge type '{brow['struct_type']}' provides unlimited vertical clearance "
+                f"in the open position — code 999.9 per SNBI."
+            )
+            w_feats = [r["feature_id"] for r in conn.execute("""
+                SELECT feature_id FROM evidence
+                WHERE bridge_id = ? AND item_id = 'B.N.03'
+            """, (brow["bridge_id"],)).fetchall()]
+            for fid in w_feats:
+                if not args.dry_run:
+                    conn.execute("""
+                        UPDATE evidence
+                        SET brm_value       = '999.9',
+                            brm_source_col  = 'struct_type (08_import_infobridge)',
+                            plan_reasoning  = ?,
+                            updated_at      = datetime('now')
+                        WHERE bridge_id = ? AND item_id = 'B.N.03'
+                          AND feature_id = ? AND brm_value IS NULL
+                    """, (reasoning, brow["bridge_id"], fid))
+                label = "[DRY RUN] " if args.dry_run else ""
+                print(f"  {label}{brow['bridge_id']} ({brow['struct_type']}): B.N.03 = 999.9")
+                unlimited_count += 1
+
     if not args.dry_run:
         conn.commit()
     conn.close()
 
     print(f"\n  InfoBridge rows read       : {counts['rows']}")
+    print(f"  B.N.03 unlimited clearance : {unlimited_count}")
     print(f"  No NBI->BrM mapping       : {counts['no_map']}")
     print(f"  Not in our DB             : {counts['not_in_db']}")
     print(f"  Evidence rows inserted    : {counts['inserted']}")
