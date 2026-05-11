@@ -197,6 +197,21 @@ def process_bridge(conn, bridge_id, extractor, verbose=True):
           )
     """, (bridge_id,))
 
+    # ── B.N.03: also un-tick for non-movable bridges ───────────────
+    # B.N.03 (Movable Bridge Max Nav Vertical Clearance) only applies when
+    # the bridge itself is a movable structure.  Fixed bridges have no raised
+    # clearance to verify regardless of B.N.01.
+    movable = conn.execute(
+        "SELECT 1 FROM bridges WHERE bridge_id = ? AND LOWER(struct_type) LIKE '%movable%'",
+        (bridge_id,),
+    ).fetchone()
+    if not movable:
+        conn.execute("""
+            UPDATE evidence
+            SET needs_field = 0, updated_at = datetime('now')
+            WHERE bridge_id = ? AND item_id = 'B.N.03' AND needs_field = 1
+        """, (bridge_id,))
+
     # ── Finalise ───────────────────────────────────────────────
     new_status = "PLANS_DONE" if pages_ok > 0 else "ERROR"
     set_bridge_status(conn, bridge_id, new_status)
