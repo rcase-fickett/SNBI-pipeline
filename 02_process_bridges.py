@@ -179,6 +179,24 @@ def process_bridge(conn, bridge_id, extractor, verbose=True):
               AND needs_field = 0
         """, [bridge_id] + auto_field_ids)
 
+    # ── Navigation sub-items: un-tick when B.N.01 = N ─────────────
+    # B.N.02-06 are only relevant for navigable waterways.  When B.N.01 is
+    # coded N the inspector has nothing to verify in the field for these items.
+    conn.execute("""
+        UPDATE evidence
+        SET needs_field = 0, updated_at = datetime('now')
+        WHERE bridge_id = ?
+          AND item_id IN ('B.N.02','B.N.03','B.N.04','B.N.05','B.N.06')
+          AND needs_field = 1
+          AND EXISTS (
+              SELECT 1 FROM evidence n
+              WHERE n.bridge_id  = evidence.bridge_id
+                AND n.feature_id = evidence.feature_id
+                AND n.item_id    = 'B.N.01'
+                AND COALESCE(n.plan_value, n.brm_value) = 'N'
+          )
+    """, (bridge_id,))
+
     # ── Finalise ───────────────────────────────────────────────
     new_status = "PLANS_DONE" if pages_ok > 0 else "ERROR"
     set_bridge_status(conn, bridge_id, new_status)
