@@ -132,6 +132,11 @@ def build_prompt(ctx, existing_features):
         "   (origin and destination), return [] for those ramp features. Phase 2 plan drawings",
         "   will enumerate ramps with HIGH confidence.",
         "4. OSM and road data are provided for name clarification only, not feature discovery.",
+        "5. Do NOT create a second carried-on H feature for the same highway name already in the",
+        "   existing list. OSM sometimes maps a single bridge as multiple highway ways (e.g. each",
+        "   bascule span, or separate oneway ways for an undivided road) — these are NOT separate",
+        "   highway features. Only create EB/WB directional features when CARRIES explicitly lists",
+        "   two separate directions OR when ODOT layer 377 confirms a physical/mountable median.",
     ]
 
     LOC_LABEL = {"C": "carried on", "B": "below", "A": "above"}

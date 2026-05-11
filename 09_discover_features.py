@@ -24,7 +24,7 @@ import os, sys, time, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DB_PATH
 from lib.db import get_conn, migrate_db
-from lib.geo_context import get_bridge_coords, discover_features
+from lib.geo_context import get_bridge_coords, discover_features, query_lane_counts
 
 try:
     from lib.snbi_items import ITEM_BY_ID
@@ -112,6 +112,68 @@ def fill_rr01(conn, bridge_id, feature_id, service_type, dry_run):
         return "inserted"
 
 
+def get_bf03_value(conn, bridge_id, feature_id):
+    """Return the best available B.F.03 value (plan_value preferred, then brm_value)."""
+    row = conn.execute(
+        "SELECT plan_value, brm_value FROM evidence "
+        "WHERE bridge_id=? AND item_id='B.F.03' AND feature_id=?",
+        (bridge_id, feature_id)
+    ).fetchone()
+    if not row:
+        return ""
+    return (row["plan_value"] or row["brm_value"] or "").strip()
+
+
+def fill_bh08(conn, bridge_id, feature_id, lanes, source, dry_run):
+    """Write B.H.08 brm_value if currently null. Returns True if written."""
+    row = conn.execute(
+        "SELECT id, brm_value FROM evidence "
+        "WHERE bridge_id=? AND item_id='B.H.08' AND feature_id=?",
+        (bridge_id, feature_id)
+    ).fetchone()
+    if not row or row["brm_value"]:
+        return False
+    if not dry_run:
+        conn.execute(
+            "UPDATE evidence SET brm_value=?, brm_source_col=?, "
+            "updated_at=datetime('now') WHERE id=?",
+            (str(lanes), source, row["id"])
+        )
+    return True
+
+
+def pick_lane_count(gis_lanes, feature_name):
+    """
+    Choose the best lane count from a list of GIS results for a named feature.
+
+    Matching priority:
+      1. HWYNUMB from layer 126 appears anywhere in feature_name (e.g. "22" in "OR-22")
+      2. Single unique count → use it regardless of name
+      3. Multiple counts, no match → return the most common count (or first)
+    """
+    if not gis_lanes:
+        return None
+
+    # Try HWYNUMB match against the feature route name
+    fname_upper = feature_name.upper()
+    for entry in gis_lanes:
+        hwy = entry["hwynumb"]
+        if hwy and hwy in fname_upper:
+            return entry["no_lanes"]
+
+    # Single unique count
+    unique = list({e["no_lanes"] for e in gis_lanes})
+    if len(unique) == 1:
+        return unique[0]
+
+    # Multiple counts — return most frequent; break ties with smallest value
+    from collections import Counter
+    freq = Counter(e["no_lanes"] for e in gis_lanes)
+    max_freq = max(freq.values())
+    candidates = sorted(k for k, v in freq.items() if v == max_freq)
+    return candidates[0]
+
+
 def add_pathway_feature(conn, bridge_id, feature_id, name, source, dry_run):
     """Seed B.F.01/02/03 for a new P* feature if it doesn't already exist."""
     exists = conn.execute(
@@ -181,6 +243,8 @@ def main():
         coords_fetched=0, coords_failed=0, no_coords=0,
         f03_updated=0, rr01_written=0,
         p01_added=0, p02_added=0,
+        bh08_written=0,
+        lane_flags=0,
     )
 
     for i, bridge_row in enumerate(rows):
@@ -246,6 +310,81 @@ def main():
                     if args.verbose:
                         print(f"  [{bridge_id}] {fid} B.F.03 -> '{gis['waterway_name']}'")
 
+        # ── H* B.H.08: Lane counts from ODOT TransGIS layers 126/347 ────
+        h_fids = get_feature_ids(conn, bridge_id, "H")
+        if h_fids:
+            gis_lanes = query_lane_counts(lat, lon)
+            if gis_lanes:
+                for fid in h_fids:
+                    fname  = get_bf03_value(conn, bridge_id, fid)
+                    chosen = pick_lane_count(gis_lanes, fname)
+                    if chosen and fill_bh08(conn, bridge_id, fid, chosen, GIS_SOURCE, args.dry_run):
+                        counts["bh08_written"] += 1
+                        if args.verbose:
+                            print(f"  [{bridge_id}] {fid} B.H.08={chosen}  (GIS, matched '{fname}')")
+
+        # ── Lane-count validation: flag feature-count mismatches ─────────
+        # Compare GIS lane count (per road segment) against BrM NBI 28A
+        # (total lanes on structure) to catch over-counted or missing features.
+        #
+        # Divided highway: ODOT LRS records one directional segment at the
+        # bridge, so GIS < BrM total → a second carried-on H feature may
+        # be needed.
+        # Duplicate features: if GIS × 1 already equals BrM but multiple
+        # carried-on H features exist, the extras are likely duplicates.
+        if h_fids and gis_lanes:
+            gis_max = max(e["no_lanes"] for e in gis_lanes)
+
+            # BrM total from H01 B.H.08 (InfoBridge NBI 28A)
+            brm_row = conn.execute("""
+                SELECT brm_value FROM evidence
+                WHERE bridge_id=? AND item_id='B.H.08' AND feature_id='H01'
+                  AND brm_source_col LIKE '%InfoBridge%'
+            """, (bridge_id,)).fetchone()
+
+            if brm_row and brm_row["brm_value"]:
+                try:
+                    brm_total = int(brm_row["brm_value"])
+                except ValueError:
+                    brm_total = None
+
+                if brm_total and brm_total > 0:
+                    carried_fids = [
+                        fid for fid in h_fids if is_carried(conn, bridge_id, fid)
+                    ]
+                    n_carried = len(carried_fids)
+                    flag_msg = None
+
+                    if gis_max < brm_total and n_carried == 1:
+                        # GIS shows fewer lanes than BrM total → likely divided
+                        flag_msg = (
+                            f"GIS lane count ({gis_max}) is less than BrM total lanes on "
+                            f"structure ({brm_total}). This may indicate a divided highway "
+                            f"where only one directional carriageway is captured in GIS — "
+                            f"verify whether a second carried-on H feature (e.g. EB/WB) is needed."
+                        )
+                    elif n_carried > 1 and gis_max >= brm_total:
+                        # GIS count alone accounts for all BrM lanes → extras likely duplicate
+                        flag_msg = (
+                            f"GIS lane count ({gis_max}) accounts for all BrM lanes on "
+                            f"structure ({brm_total}), but {n_carried} carried-on H features "
+                            f"exist. Verify whether multiple H features are warranted — "
+                            f"possible duplicate features created by Phase 11."
+                        )
+
+                    if flag_msg:
+                        counts["lane_flags"] += 1
+                        if args.verbose:
+                            print(f"  [{bridge_id}] LANE FLAG: {flag_msg[:80]}...")
+                        if not args.dry_run:
+                            conn.execute("""
+                                UPDATE evidence
+                                SET auto_questions = ?,
+                                    updated_at     = datetime('now')
+                                WHERE bridge_id=? AND item_id='B.H.08' AND feature_id='H01'
+                                  AND (auto_questions IS NULL OR auto_questions = '')
+                            """, (flag_msg, bridge_id))
+
         # ── P01: Sidewalk feature ────────────────────────────────────────
         if gis["has_sidewalk"]:
             if add_pathway_feature(conn, bridge_id, "P01", gis["sidewalk_desc"],
@@ -280,6 +419,8 @@ def main():
     print(f"  B.RR.01 service types    : {counts['rr01_written']}")
     print(f"  P01 sidewalk features    : {counts['p01_added']}")
     print(f"  P02 bicycle features     : {counts['p02_added']}")
+    print(f"  B.H.08 lane counts       : {counts['bh08_written']}")
+    print(f"  Lane-count flags         : {counts['lane_flags']}")
 
     if args.dry_run:
         print("\n  Dry run complete - run without --dry-run to apply.")

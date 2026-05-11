@@ -150,6 +150,50 @@ def build_context_block(lat, lon):
     return "\n".join(lines)
 
 
+def query_lane_counts(lat, lon, radius_m=75):
+    """
+    Query ODOT TransGIS layers 126 (state roads) and 347 (non-state roads) for
+    travel lane counts at a bridge location.
+
+    Returns list of {"no_lanes": int, "hwynumb": str} dicts, state-road results
+    first (layer 126 has HWYNUMB for route matching), then non-state (layer 347).
+    Duplicates (same lanes + hwynumb pair) are removed.
+    """
+    results = []
+    seen    = set()
+
+    # Layer 126 — State highways; has HWYNUMB for route matching
+    for feat in _query_layer(126, lat, lon, radius_m, "NO_LANES,HWYNUMB"):
+        a = feat.get("attributes", {})
+        try:
+            lanes = int(a.get("NO_LANES") or 0)
+        except (ValueError, TypeError):
+            continue
+        if lanes <= 0:
+            continue
+        hwy = (a.get("HWYNUMB") or "").strip().lstrip("0")
+        key = (lanes, hwy)
+        if key not in seen:
+            seen.add(key)
+            results.append({"no_lanes": lanes, "hwynumb": hwy})
+
+    # Layer 347 — Non-state roads; no HWYNUMB
+    for feat in _query_layer(347, lat, lon, radius_m, "NO_LANES"):
+        a = feat.get("attributes", {})
+        try:
+            lanes = int(a.get("NO_LANES") or 0)
+        except (ValueError, TypeError):
+            continue
+        if lanes <= 0:
+            continue
+        key = (lanes, "")
+        if key not in seen:
+            seen.add(key)
+            results.append({"no_lanes": lanes, "hwynumb": ""})
+
+    return results
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Feature Discovery — used by 09_discover_features.py
 # ═══════════════════════════════════════════════════════════════════════════
