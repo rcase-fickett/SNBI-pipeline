@@ -28,12 +28,20 @@ VC_LIST_PATH      = os.path.join(BRIDGES_ROOT, "Vertical Clearance List.xlsx")
 # ----------------------------------------------------------
 # 3. Output database path
 # ----------------------------------------------------------
-DB_PATH = r"snbi_evidence.db"
+# When running from a git worktree (.claude/worktrees/NAME/), resolve DB and reference
+# files relative to the real project root three levels up, not the worktree directory.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if ".claude" in _THIS_DIR.replace("\\", "/"):
+    _PROJECT_ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", "..", ".."))
+else:
+    _PROJECT_ROOT = _THIS_DIR
+
+DB_PATH = os.path.join(_PROJECT_ROOT, "snbi_evidence.db")
 
 # ----------------------------------------------------------
 # 4. Output Excel review workbook
 # ----------------------------------------------------------
-REVIEW_EXCEL_PATH = r"SNBI_Review.xlsx"
+REVIEW_EXCEL_PATH = os.path.join(_PROJECT_ROOT, "SNBI_Review.xlsx")
 
 # ----------------------------------------------------------
 # 5. Anthropic API key
@@ -47,9 +55,9 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 # 6. Processing settings
 # ----------------------------------------------------------
 CLAUDE_MODEL      = "claude-sonnet-4-6"
-IMAGE_DPI         = 150          # DPI for PDF → image conversion (150 is good balance)
+IMAGE_DPI         = 200          # DPI for PDF → image conversion (200 gives sharper plan images)
 MAX_IMAGE_PX      = 3000         # Max dimension in pixels before downscaling
-BATCH_DELAY_SEC   = 1.0          # Seconds between API calls (rate limit buffer)
+BATCH_DELAY_SEC   = 15.0         # Seconds between API calls (rate limit buffer)
 SKIP_COMPLETED    = True         # Skip bridges already in DB with PLANS_DONE status
 
 # ----------------------------------------------------------
@@ -60,8 +68,7 @@ SKIP_COMPLETED    = True         # Skip bridges already in DB with PLANS_DONE st
 BRIDGE_FILTER = None
 
 # ----------------------------------------------------------
-# 8. (Legacy — no longer used for filtering)
-#    Bridge_List.xlsx filter settings kept for reference only.
+# 8. Column name in Bridge_List.xlsx that flags target bridges
 # ----------------------------------------------------------
 COMPLETE_COL    = "Complete"
 COMPLETE_VALUE  = "Completed via script with pdf"
@@ -69,9 +76,8 @@ BRIDGE_ID_COL   = "STRUCT_ID"
 
 # ----------------------------------------------------------
 # 9. Reference documents sent to Claude API for context
-#    Paths relative to this config file.
+#    Resolved from project root (handles both normal runs and worktree runs).
 #    Set to None to disable a document.
 # ----------------------------------------------------------
-_CFG_DIR = os.path.dirname(os.path.abspath(__file__))
-SNBI_ERRATA_PDF    = os.path.join(_CFG_DIR, "SNBI March 2022 Errata 01.pdf")
-DATACROSSWALK_PATH = os.path.join(_CFG_DIR, "datacrosswalk.xlsx")
+SNBI_ERRATA_PDF    = os.path.join(_PROJECT_ROOT, "SNBI March 2022 Errata 01.pdf")
+DATACROSSWALK_PATH = os.path.join(_PROJECT_ROOT, "datacrosswalk.xlsx")

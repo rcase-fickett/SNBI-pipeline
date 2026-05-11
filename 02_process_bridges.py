@@ -44,7 +44,10 @@ def process_bridge(conn, bridge_id, extractor, verbose=True):
         print(f"  [{bridge_id}] Not found in database — run Phase 1 first.")
         return False
 
-    plan_path = bridge["plan_pdf_path"]
+    # Prefer dynamically-constructed path so the script works across machines
+    plan_path = os.path.join(config.BRIDGES_ROOT, bridge_id, f"{bridge_id} Plans.pdf")
+    if not os.path.exists(plan_path):
+        plan_path = bridge["plan_pdf_path"]  # fall back to stored path
     if not plan_path or not os.path.exists(plan_path):
         msg = f"Plan PDF not found: {plan_path}"
         log(conn, bridge_id, "PLANS", "SKIPPED", msg)
@@ -219,7 +222,7 @@ def main():
         model=config.CLAUDE_MODEL,
         delay_sec=config.BATCH_DELAY_SEC,
         lessons=lessons,
-        errata_b64=ref_docs.get("errata_b64"),
+        errata_pdf_path=ref_docs.get("errata_pdf_path"),
         crosswalk_text=ref_docs.get("crosswalk_text"),
     )
 
@@ -233,6 +236,9 @@ def main():
                    get_bridges_by_status(conn, "ERROR"))
     else:
         bridges = get_bridges_by_status(conn, "BRM_DONE")
+
+    if config.BRIDGE_FILTER:
+        bridges = [b for b in bridges if b["bridge_id"] in config.BRIDGE_FILTER]
 
     if args.limit:
         bridges = bridges[:args.limit]
@@ -266,7 +272,10 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"  Done. Success: {success}  Errors: {errors}")
-    print_stats(conn)
+    try:
+        print_stats(conn)
+    except UnicodeEncodeError:
+        pass  # box-drawing chars fail on cp1252 consoles; stats already in DB
     conn.close()
     print("Next step: run  python 03_export_csv.py")
 

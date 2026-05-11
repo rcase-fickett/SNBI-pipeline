@@ -8,9 +8,12 @@ Logic:
      available waterway name: B.F.03 plan_value > B.F.03 brm_value >
      bridges.feature_intersected (in priority order).
   2. Look up the name in the USCG 13th District list (lib/nav_waterways.py).
-  3. If found → write B.N.01 plan_value ("Y" or "N") with APPROX confidence,
+  3. If found on list → write B.N.01 plan_value ("Y" or "N") with APPROX confidence,
      but only if plan_value is currently NULL (idempotent; never downgrades HIGH).
-  4. If not found → leave PENDING for Phase 2 / inspector review.
+  4. If NOT found on list → write "N" with APPROX confidence. The USCG 13th District
+     list is the authoritative source for OR/WA/ID/MT navigability; absence from the
+     list means non-navigable for practical purposes. Inspectors can override if they
+     find contrary evidence (USCG permit stamp in plans, tidal influence, etc.).
 
 Source document:
   Navigability_Determination_for_the_13th_Coast_Guard_District.pdf
@@ -89,7 +92,7 @@ def run(dry_run: bool, bridge_filter: str | None, verbose: bool):
     rows = get_waterway_bridges(conn, bridge_filter)
     print(f"Waterway bridges with B.N.01 pending: {len(rows)}")
 
-    matched = skipped = not_found = 0
+    matched_list = matched_default = skipped = 0
 
     for row in rows:
         bridge_id = row["bridge_id"]
@@ -104,10 +107,12 @@ def run(dry_run: bool, bridge_filter: str | None, verbose: bool):
         nav_result, reasoning = lookup_with_reasoning(name, state="OR")
 
         if nav_result is None:
-            if verbose:
-                print(f"  {bridge_id}: '{name}' — {reasoning}")
-            not_found += 1
-            continue
+            # Not on the USCG 13th District list → default to N (non-navigable)
+            nav_result = "N"
+            reasoning = f"'{name}' not found on USCG 13th District navigability list — defaulting to N. Override if USCG permit evidence exists."
+            matched_default += 1
+        else:
+            matched_list += 1
 
         if not dry_run:
             conn.execute(
@@ -122,15 +127,15 @@ def run(dry_run: bool, bridge_filter: str | None, verbose: bool):
             )
 
         label = "[DRY RUN] " if dry_run else ""
-        print(f"  {label}{bridge_id}: '{name}' -> B.N.01={nav_result}  ({reasoning})")
-        matched += 1
+        if verbose or nav_result == "Y":
+            print(f"  {label}{bridge_id}: '{name}' -> B.N.01={nav_result}  ({reasoning})")
 
     if not dry_run:
         conn.commit()
 
     conn.close()
     print(
-        f"\nDone - set: {matched}  not found: {not_found}  skipped (no name): {skipped}"
+        f"\nDone - from list: {matched_list}  defaulted N: {matched_default}  skipped (no name): {skipped}"
     )
     if dry_run:
         print("(dry run - no changes written)")
