@@ -468,7 +468,7 @@ class ClaudeExtractorWithLessons(ClaudeExtractor):
         PAGE_RAIL:      ["B.RH.01","B.RH.02"],
         PAGE_NOTES:     ["B.W.01","B.RR.01","B.N.01"],
         PAGE_VICINITY:  ["B.W.01","B.G.13","B.F.03"],
-        PAGE_BENT:      ["B.N.06"],
+        PAGE_BENT:      ["B.N.05","B.N.06"],
         PAGE_CLEARANCE: ["B.H.12","B.H.13","B.H.14","B.H.15","B.RR.02","B.RR.03"],
     }
 
