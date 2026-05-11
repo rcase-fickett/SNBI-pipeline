@@ -160,7 +160,21 @@ def process_bridge(conn, bridge_id, extractor, verbose=True):
             except Exception as e:
                 log(conn, bridge_id, "CLEARANCE", "ERROR", str(e)[-200:])
 
-    # ── Mark items still PENDING as NOT_FOUND (AI processed but found nothing) ──
+    # ── Mark items still PENDING ────────────────────────────────
+    # Items with default_confidence=FIELD_REQ are always field-measured;
+    # set those first, then sweep the rest to NOT_FOUND.
+    from lib.snbi_items import ITEMS as _ITEMS
+    field_req_ids = [i["id"] for i in _ITEMS
+                     if i.get("default_confidence") == FIELD_REQ]
+    if field_req_ids:
+        placeholders = ",".join("?" * len(field_req_ids))
+        conn.execute(f"""
+            UPDATE evidence
+            SET plan_confidence = 'FIELD_REQ', updated_at = datetime('now')
+            WHERE bridge_id = ? AND plan_confidence = 'PENDING'
+              AND item_id IN ({placeholders})
+        """, [bridge_id] + field_req_ids)
+
     conn.execute("""
         UPDATE evidence
         SET plan_confidence = 'NOT_FOUND', updated_at = datetime('now')
