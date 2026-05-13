@@ -86,7 +86,138 @@
     <a href="/review" class="btn btn-ghost">All Evidence →</a>
   </div>
 
+  <!-- SNBI Validation card -->
+  <div class="card" style="margin-top:1.5rem">
+    <div class="section-label">SNBI Validation</div>
+    <p style="font-size:12px;color:#64748b;margin:.25rem 0 .75rem">
+      Check evidence values against FHWA SNBI validation rules.
+      Exports a colour-coded Excel report to your Downloads folder.
+    </p>
+
+    <!-- Bridge scope selector -->
+    <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem">
+      <label style="font-size:12px;color:#475569;font-weight:600">Scope:</label>
+      <select id="val-scope" onchange="updateValScope()" style="font-size:12px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:4px">
+        <option value="all">All bridges ({{ total_bridges }})</option>
+        {% for row in bridge_stats %}
+        <option value="status:{{ row.processing_status }}">{{ row.processing_status }} ({{ row.n }})</option>
+        {% endfor %}
+        <option value="custom">Custom selection…</option>
+      </select>
+      <span id="val-scope-count" style="font-size:11px;color:#94a3b8"></span>
+    </div>
+
+    <!-- Custom bridge ID entry (hidden by default) -->
+    <div id="val-custom-row" style="display:none;margin-bottom:.75rem">
+      <textarea id="val-custom-ids" rows="3"
+        placeholder="Enter bridge IDs separated by commas or newlines, e.g.: 00511, 02254A, 02758"
+        style="width:100%;max-width:480px;font-size:12px;padding:4px 6px;
+               border:1px solid #cbd5e1;border-radius:4px;font-family:monospace;resize:vertical"></textarea>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+      <button id="btn-val-export" class="btn btn-primary" onclick="startValidationExport()"
+              style="background:#1e3a5f">
+        ▶ Run &amp; Export to Excel
+      </button>
+      <div id="val-progress" style="display:none;font-size:12px;color:#475569">
+        <span id="val-prog-text">Starting…</span>
+        <div style="background:#e2e8f0;border-radius:4px;height:6px;width:200px;
+                    overflow:hidden;margin-top:4px">
+          <div id="val-prog-bar" style="background:#1e3a5f;height:100%;width:0%;
+                                        border-radius:4px;transition:width .3s"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="val-log" style="display:none;margin-top:.75rem;font-family:monospace;font-size:11px;
+                              color:#475569;background:#f8fafc;border:1px solid #e2e8f0;
+                              border-radius:4px;padding:.5rem;max-height:120px;overflow-y:auto"></div>
+    <div id="val-result" style="margin-top:.5rem;font-size:13px"></div>
+  </div>
+
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function updateValScope() {
+  const sel = document.getElementById('val-scope').value;
+  document.getElementById('val-custom-row').style.display = sel === 'custom' ? 'block' : 'none';
+}
+
+async function startValidationExport() {
+  const btn    = document.getElementById('btn-val-export');
+  const prog   = document.getElementById('val-progress');
+  const log    = document.getElementById('val-log');
+  const result = document.getElementById('val-result');
+
+  btn.disabled = true;
+  prog.style.display = 'flex';
+  prog.style.flexDirection = 'column';
+  log.style.display = 'block';
+  log.innerHTML = '';
+  result.innerHTML = '';
+
+  const scope = document.getElementById('val-scope').value;
+  let bridge_ids = null;   // null = all
+
+  if (scope.startsWith('status:')) {
+    // Fetch IDs for that status
+    const status = scope.replace('status:', '');
+    const data   = await fetch(`/api/bridge-ids?status=${encodeURIComponent(status)}`).then(r=>r.json());
+    bridge_ids   = data.ids || [];
+  } else if (scope === 'custom') {
+    const raw    = document.getElementById('val-custom-ids').value;
+    bridge_ids   = raw.split(/[\s,\n]+/).map(s=>s.trim().toUpperCase()).filter(Boolean);
+    if (!bridge_ids.length) {
+      result.innerHTML = '<span style="color:#ef4444">No bridge IDs entered.</span>';
+      btn.disabled = false;
+      prog.style.display = 'none';
+      return;
+    }
+  }
+  // scope === 'all': send empty list → server uses all bridges
+
+  const resp = await fetch('/api/validate/export', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ bridge_ids: bridge_ids || [] }),
+  }).then(r => r.json());
+
+  if (!resp.ok) {
+    result.innerHTML = `<span style="color:#ef4444">Error: ${resp.error}</span>`;
+    btn.disabled = false;
+    prog.style.display = 'none';
+    return;
+  }
+
+  // Poll for status
+  const interval = setInterval(async () => {
+    const st = await fetch('/api/validate/status').then(r=>r.json());
+    const pct = st.total > 0 ? Math.round(st.done / st.total * 100) : 0;
+    document.getElementById('val-prog-text').textContent =
+      `${st.done} / ${st.total} bridges (${pct}%)${st.errors ? ' — ' + st.errors + ' error(s)' : ''}`;
+    document.getElementById('val-prog-bar').style.width = pct + '%';
+    // Tail the log
+    if (st.log && st.log.length) {
+      log.innerHTML = st.log.slice(-30).join('<br>');
+      log.scrollTop = log.scrollHeight;
+    }
+    if (!st.running) {
+      clearInterval(interval);
+      btn.disabled = false;
+      if (st.export_path) {
+        const fname = st.export_path.replace(/\\/g, '/').split('/').pop();
+        result.innerHTML = `<span style="color:#16a34a;font-weight:600">
+          ✓ Exported: ${fname} — check your Downloads folder.</span>`;
+      } else {
+        result.innerHTML = '<span style="color:#ef4444">Export failed — see log.</span>';
+      }
+    }
+  }, 1000);
+}
+</script>
 {% endblock %}
 <html xmlns:mso="urn:schemas-microsoft-com:office:office" xmlns:msdt="uuid:C2F41010-65B3-11d1-A29F-00AA00C14882"><head>
 <!--[if gte mso 9]><xml>

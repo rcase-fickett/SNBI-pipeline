@@ -18,9 +18,14 @@ SNBI item mappings (DataCrosswalk Clean/Partial transitions):
   NBI 38   -> B.N.01 on W* below    (Navigation control -- navigable waterway Y/N)
   NBI 39   -> B.N.02 on W* below    (Navigation vertical clearance)
   NBI 40   -> B.N.04 on W* below    (Navigation horizontal clearance)
-  NBI 111  -> B.N.06 on W* below    (Pier/abutment protection)
-  NBI 116  -> B.N.03 on W* below    (Lift bridge clearance when raised -- movable only)
-  struct_type -> B.N.03 = 999.9     (Bascule/swing/tilt/pivot/retractable -- unlimited clearance)
+  NBI 116  -> B.N.03 on W* below    (Lift bridge clearance when raised -- plan_value/APPROX)
+  struct_type -> B.N.03 = 999.9     (Bascule/swing/tilt/pivot/retractable -- plan_value/APPROX)
+
+NOTE: B.N.03, B.N.05, and B.N.06 have no BrM column (brm_col=None).  Values for these
+items are derived/inferred, so they are written to plan_value with APPROX confidence rather
+than brm_value.  B.N.05 (9999.9 / 0) and B.N.06 (codes 0-5) require field inspection and
+are left PENDING -- add pre-fill logic here using upsert_approx() if a reliable source
+is identified.
 
 Below features are resolved per bridge via get_below_features() using B.F.02='B', so
 divided-highway bridges (where H02 is a second carried feature) are handled correctly.
@@ -92,6 +97,55 @@ def build_id_map(brm_path):
 def find_latest_file(script_dir):
     files = sorted(glob.glob(os.path.join(script_dir, "Selected_Bridges_*.txt")), reverse=True)
     return files[0] if files else None
+
+
+def upsert_approx(conn, bridge_id, feature_id, item_id, item_name, value, reasoning,
+                  dry_run, verbose):
+    """
+    Write value to plan_value / plan_confidence='APPROX'.
+    Used for items with brm_col=None whose values are derived rather than pulled
+    directly from a BrM field (e.g. B.N.03 inferred from bridge type).
+    Only fills rows where plan_value is currently null/pending.
+    """
+    feat_exists = conn.execute(
+        "SELECT 1 FROM evidence WHERE bridge_id=? AND feature_id=? LIMIT 1",
+        (bridge_id, feature_id),
+    ).fetchone()
+    if not feat_exists:
+        return None
+
+    row = conn.execute(
+        "SELECT id, plan_value, plan_confidence FROM evidence "
+        "WHERE bridge_id=? AND item_id=? AND feature_id=?",
+        (bridge_id, item_id, feature_id),
+    ).fetchone()
+
+    if row:
+        pv = (row["plan_value"] or "").strip()
+        pc = (row["plan_confidence"] or "").strip()
+        if pv and pc not in ("PENDING", "NOT_FOUND", ""):
+            return None  # already has a real plan value
+        if not dry_run:
+            conn.execute(
+                "UPDATE evidence SET plan_value=?, plan_confidence='APPROX', "
+                "plan_reasoning=?, updated_at=datetime('now') WHERE id=?",
+                (str(value), reasoning, row["id"]),
+            )
+        if verbose:
+            print(f"  {'DRY ' if dry_run else ''}APPROX [{bridge_id}] {feature_id} {item_id} = {value}")
+        return "updated"
+    else:
+        if not dry_run:
+            conn.execute(
+                "INSERT INTO evidence "
+                "(bridge_id, item_id, feature_id, item_name, plan_value, "
+                " plan_confidence, plan_reasoning, brm_source_col, status) "
+                "VALUES (?,?,?,?,?,'APPROX',?,?,'PENDING')",
+                (bridge_id, item_id, feature_id, item_name, str(value), reasoning, SOURCE),
+            )
+        if verbose:
+            print(f"  {'DRY ' if dry_run else ''}APPROX INSERT [{bridge_id}] {feature_id} {item_id} = {value}")
+        return "inserted"
 
 
 def upsert_ev(conn, bridge_id, feature_id, item_id, item_name, value, dry_run, verbose,
@@ -291,8 +345,15 @@ def main():
 
             lift_vc = safe_float(row.get("116 - Minimum Vertical Clearance - Lift Bridge (ft.)", ""))
             if lift_vc is not None and 0 < lift_vc < 99.0 and w_below:
+                lift_reasoning = (
+                    f"NBI Item 116 (Minimum Vertical Clearance — Lift Bridge): {lift_vc:.1f} ft. "
+                    "B.N.03 has no BrM column; value stored as APPROX plan value."
+                )
                 for fid in w_below:
-                    ev(fid, "B.N.03", "Movable Bridge Max Nav Vertical Clearance", f"{lift_vc:.1f}")
+                    track(upsert_approx(conn, bridge_id, fid, "B.N.03",
+                                        "Movable Bridge Max Nav Vertical Clearance",
+                                        f"{lift_vc:.1f}", lift_reasoning,
+                                        args.dry_run, args.verbose))
 
             nav_hc = safe_float(row.get("40 - Navigation Horizontal Clearance (ft.)", ""))
             if nav_hc is not None and nav_hc > 0 and w_below:
@@ -304,19 +365,43 @@ def main():
             # SNBI codes 0-1 also require a formal engineering assessment, not field obs.
             # Leave as PENDING for inspector determination.
 
+    # ── B.N.03: migrate any legacy brm_value rows → plan_value/APPROX ────────
+    # Earlier runs wrote 999.9 to brm_value; B.N.03 has no BrM column so those
+    # should live in plan_value instead.
+    migrated = 0
+    if not args.dry_run:
+        migrated = conn.execute("""
+            UPDATE evidence
+            SET plan_value      = COALESCE(NULLIF(plan_value,''), brm_value),
+                plan_confidence = CASE
+                    WHEN plan_confidence IN ('PENDING','NOT_FOUND','') OR plan_confidence IS NULL
+                    THEN 'APPROX'
+                    ELSE plan_confidence
+                END,
+                brm_value       = NULL,
+                updated_at      = datetime('now')
+            WHERE item_id   = 'B.N.03'
+              AND brm_value IS NOT NULL
+        """).rowcount
+    if migrated:
+        print(f"  Migrated {migrated} existing B.N.03 brm_value row(s) -> plan_value/APPROX")
+
     # ── B.N.03: 999.9 for bascule/swing/tilt/pivot/retractable bridges ───────
     # These bridge types provide unlimited clearance in the open position.
     # Vertical lift bridges (Movable-Lift) are excluded — they have a specific
     # raised clearance already sourced from NBI 116 above.
+    # Written to plan_value/APPROX (not brm_value) because B.N.03 has no BrM column.
     UNLIMITED_CLEARANCE_KEYWORDS = [
         "bascule", "swing", "tilt", "thrust", "pivot", "retractable",
     ]
     unlimited_bridges = conn.execute("""
-        SELECT b.bridge_id, b.struct_type
+        SELECT DISTINCT b.bridge_id, b.struct_type
         FROM bridges b
         JOIN evidence e ON e.bridge_id = b.bridge_id
         WHERE e.item_id = 'B.N.03'
-          AND e.brm_value IS NULL
+          AND (e.plan_value IS NULL
+               OR e.plan_confidence IN ('PENDING','NOT_FOUND','')
+               OR e.plan_confidence IS NULL)
     """).fetchall()
 
     unlimited_count = 0
@@ -325,26 +410,21 @@ def main():
         if any(kw in st for kw in UNLIMITED_CLEARANCE_KEYWORDS):
             reasoning = (
                 f"Bridge type '{brow['struct_type']}' provides unlimited vertical clearance "
-                f"in the open position — code 999.9 per SNBI."
+                "in the open position — code 999.9 per SNBI. "
+                "B.N.03 has no BrM column; value stored as APPROX plan value."
             )
-            w_feats = [r["feature_id"] for r in conn.execute("""
-                SELECT feature_id FROM evidence
-                WHERE bridge_id = ? AND item_id = 'B.N.03'
-            """, (brow["bridge_id"],)).fetchall()]
+            w_feats = [r["feature_id"] for r in conn.execute(
+                "SELECT feature_id FROM evidence WHERE bridge_id=? AND item_id='B.N.03'",
+                (brow["bridge_id"],),
+            ).fetchall()]
             for fid in w_feats:
-                if not args.dry_run:
-                    conn.execute("""
-                        UPDATE evidence
-                        SET brm_value       = '999.9',
-                            brm_source_col  = 'struct_type (08_import_infobridge)',
-                            plan_reasoning  = ?,
-                            updated_at      = datetime('now')
-                        WHERE bridge_id = ? AND item_id = 'B.N.03'
-                          AND feature_id = ? AND brm_value IS NULL
-                    """, (reasoning, brow["bridge_id"], fid))
-                label = "[DRY RUN] " if args.dry_run else ""
-                print(f"  {label}{brow['bridge_id']} ({brow['struct_type']}): B.N.03 = 999.9")
-                unlimited_count += 1
+                result = upsert_approx(conn, brow["bridge_id"], fid, "B.N.03",
+                                       "Movable Bridge Max Nav Vertical Clearance",
+                                       "999.9", reasoning, args.dry_run, args.verbose)
+                if result:
+                    label = "[DRY RUN] " if args.dry_run else ""
+                    print(f"  {label}{brow['bridge_id']} ({brow['struct_type']}): B.N.03 = 999.9 (APPROX)")
+                    unlimited_count += 1
 
     if not args.dry_run:
         conn.commit()

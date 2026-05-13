@@ -53,10 +53,10 @@ def merge_plan_result(conn, bridge_id, result, page_info):
 def merge_section_result(conn, bridge_id, result, page_info):
     source_tag = f"Dwg {page_info.get('drawing_number','')} ({page_info.get('doc_type_str','')} {page_info.get('year','')})"
 
-    for item_id in ("B.G.05","B.G.07","B.G.08","B.G.10","B.H.16"):
+    for item_id in ("B.G.05","B.G.07","B.G.08","B.G.10"):
         _merge_item(conn, bridge_id, "PRIMARY", result, item_id, source_tag)
 
-    # B.H.08 and B.H.16 are per highway feature
+    # B.H.08 and B.H.16 belong on H* features, not PRIMARY
     if "B.H.08" in result and result["B.H.08"].get("value") is not None:
         r = result["B.H.08"]
         _write_evidence(conn, bridge_id, "B.H.08", "H01",

@@ -56,6 +56,7 @@ def get_waterway_bridges(conn, bridge_id_filter=None):
             e.bridge_id,
             b.feature_intersected,
             f03.plan_value  AS f03_plan,
+            f03.gis_value   AS f03_gis,
             f03.brm_value   AS f03_brm
         FROM evidence e
         JOIN bridges b ON b.bridge_id = e.bridge_id
@@ -65,7 +66,7 @@ def get_waterway_bridges(conn, bridge_id_filter=None):
             AND f03.feature_id = 'W01'
         WHERE e.item_id    = 'B.N.01'
           AND e.feature_id = 'W01'
-          AND e.plan_value IS NULL
+          AND e.gis_value IS NULL
           AND b.feature_category = 'WATERWAY'
     """
     params = []
@@ -80,6 +81,7 @@ def best_name(row) -> str | None:
     """Pick the best waterway name from available sources."""
     return (
         (row["f03_plan"] or "").strip() or
+        (row["f03_gis"]  or "").strip() or
         (row["f03_brm"]  or "").strip() or
         (row["feature_intersected"] or "").strip() or
         None
@@ -117,13 +119,11 @@ def run(dry_run: bool, bridge_filter: str | None, verbose: bool):
         if not dry_run:
             conn.execute(
                 """UPDATE evidence
-                      SET plan_value      = ?,
-                          plan_confidence = 'APPROX',
-                          plan_reasoning  = ?,
-                          brm_source_col  = ?,
-                          updated_at      = datetime('now')
+                      SET gis_value  = ?,
+                          gis_source = ?,
+                          updated_at = datetime('now')
                     WHERE id = ?""",
-                (nav_result, reasoning, SOURCE, row["evidence_id"]),
+                (nav_result, reasoning, row["evidence_id"]),
             )
 
         label = "[DRY RUN] " if dry_run else ""

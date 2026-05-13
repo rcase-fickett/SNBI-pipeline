@@ -56,11 +56,11 @@ Or use the desktop launcher (see Deployment below).
 Pages:
 - `/` — Dashboard (bridge counts, evidence stats)
 - `/review` — Review queue (filterable evidence table)
-- `/bridge/<id>` — Per-bridge evidence review with inline PDF viewer and map
+- `/bridge/<id>` — Per-bridge evidence review with inline PDF viewer, map, and SNBI Validation panel
 - `/process` — Trigger Phase 2 processing jobs and feedback cycles
 - `/items` — Item Coding Guide: source chain and priority rule for every SNBI item
 
-The UI can trigger Phase 2 processing and the feedback cycle (Phases 4+5) in the background via `/api/process` and `/api/feedback`.
+The UI can trigger Phase 2 processing and the feedback cycle (Phases 4+5) in the background via `/api/process` and `/api/feedback`. SNBI validation runs via `/api/validate/<bridge_id>` (POST to start, GET `/api/validate/status` to poll) and results are stored in the `validation_results` table.
 
 ## Deployment (Team Launcher)
 
@@ -132,7 +132,8 @@ BrM Excel exports
 - **`pdf_extractor.py`** — Renders PDF pages to JPEG images via pypdfium2. Uses `metadata.json` in each bridge folder to route pages to the correct page type (PLAN, SECTION, RAIL, etc.).
 - **`results_merger.py`** — Parses Claude API JSON output and upserts into the `evidence` table.
 - **`brm_loader.py`** — Reads BrM Excel exports and populates the `bridges` and `evidence` tables with BrM-derived values.
-- **`geo_context.py`** — Three roles: (1) `build_context_block()` builds GIS context for Claude extraction prompts; (2) `discover_features()` / `get_bridge_coords()` are used by `09_discover_features.py` for DB enrichment; (3) `gather_feature_context()` assembles comprehensive GIS data for Phase 11. Queries ODOT TransGIS layers 101/132/136/143/164/166/377 and OSM Overpass. No API key required.
+- **`geo_context.py`** — Four roles: (1) `build_context_block()` builds GIS context for Phase 2 prompts, including lane counts from `query_lane_counts()`; (2) `discover_features()` / `get_bridge_coords()` are used by `09_discover_features.py` for DB enrichment; (3) `gather_feature_context()` assembles comprehensive GIS data for Phase 11, including `lane_counts` from layers 126/347; (4) `query_lane_counts()` queries ODOT layers 126 (state roads, has HWYNUMB) and 347 (non-state roads) for `NO_LANES` — authoritative source for B.H.08. Queries ODOT TransGIS layers 101/126/132/136/143/164/166/347/377 and OSM Overpass. No API key required.
+- **`validation.py`** — SNBI data validation engine. `validate_bridge(conn, bridge_id)` returns a sorted list of violation dicts (Safety → Critical → Error → Flag). Checks all evidence items against FHWA SNBI_Data_Validation_Rules. Effective value priority: `user_determination` → `plan_value` (if not PENDING/NOT_FOUND) → `brm_value`. Rows marked INCORRECT by the reviewer suppress their violations. Only validates feature_ids matching `^[HWRP]\d+$` — non-standard IDs (e.g. Phase 2 artifacts like `_CROSSED`) are silently skipped. Results cached in `validation_results` DB table.
 
 ### Evidence Confidence Levels
 
@@ -142,10 +143,10 @@ BrM Excel exports
 
 Evidence rows use `feature_id` to distinguish: `PRIMARY` (bridge-level), `WORK:YYYY` (rehab work), `H##` (highway), `R##` (railroad), `P##` (pathway), `W##` (waterway). Numbered sequentially within each type starting at 01. B.F.02='C' means carried on; 'B' means below; 'A' means above.
 
-Phase 11 seeds type-specific PENDING placeholder rows for every new feature_id it creates, so Phase 2 / inspectors have rows to fill:
-- H*: B.H.08, B.H.12, B.H.13, B.H.14, B.H.15, B.H.16, B.H.18 (carried-on H clearance items pre-filled as APPROX: B.H.12/13='99.9', B.H.14/15='Not reported (carried-on feature)')
-- R*: B.RR.01, B.RR.02, B.RR.03
-- W*: B.N.01, B.N.02, B.N.03, B.N.04, B.N.05, B.N.06
+Phase 11 seeds type-specific rows for every new feature_id it creates:
+- H*: B.H.08 pre-filled APPROX from ODOT lane count GIS (matched by route number in feature name; max segment count used to prefer mainline over ramps); carried-on clearance items pre-filled APPROX: B.H.12/13='99.9', B.H.14/15='Not reported (carried-on feature)'; B.H.16/18 seeded PENDING.
+- R*: B.RR.01, B.RR.02, B.RR.03 (PENDING)
+- W*: B.N.01–B.N.06 (PENDING)
 
 **Backfill gap**: Features seeded by Phases 1/9 before Phase 11 existed do not have these type-specific rows. Only Phase 11-created feature_ids get them automatically. A separate backfill script would be needed to add them retroactively.
 
@@ -164,4 +165,6 @@ Code is versioned at `https://github.com/rcase-fickett/SNBI-pipeline` (private).
 - The `datacrosswalk.xlsx` and `SNBI March 2022 Errata 01.pdf` are sent as reference context to Claude on every Phase 2 call — keep them in the project root.
 - `08_import_infobridge.py` reads the most recent `Selected_Bridges_*.txt` in the project root (auto-selected by filename sort). ID mapping: `BrM.BridgeNumber == InfoBridge "8 - Structure Number"` (strip quotes). NBI 42B routes underclearances to H*/R*/W* features. 1178 of 1184 bridges match; 6 misses are Forest Service bridges.
 - `09_discover_features.py` is idempotent — only fills null plan_values. Run after phases 1/7/8 and before phase 2. Pauses 0.3s between bridges as server courtesy. Does not create new feature_ids — use Phase 11 for feature discovery.
-- `11_discover_features_ai.py` (Phase 11) uses the Claude API (text-only, no PDFs) to enumerate all features from ODOT TransGIS + OSM data. **ODOT CARRIES/CROSSES fields on layer 101 are the only authoritative source for H/R/W features** — road names and OSM ways are supporting context only (too wide a radius; picks up adjacent structures). Pathway (P*) features may be added from ODOT sidewalk/bike layers and OSM. Uses `INSERT OR IGNORE` so Phase 1 / Phase 9 rows are never overwritten. The prompt passes each existing feature_id with its B.F.02 location and B.F.03 name (COALESCE plan_value, brm_value) so Claude knows what's already covered. Run after Phase 9 (needs coordinates) and before Phase 2. Costs ~1 API call per bridge. `--debug` prints the full prompt and raw Claude response.
+- `11_discover_features_ai.py` (Phase 11) uses the Claude API (text-only, no PDFs) to enumerate all features from ODOT TransGIS + OSM data. **ODOT CARRIES/CROSSES fields on layer 101 are the only authoritative source for H/R/W features** — road names and OSM ways are supporting context only (too wide a radius; picks up adjacent structures). **W (waterway) features must only be created when CROSSES explicitly names a waterway — road names referencing water geography (e.g. "Johnson Creek Blvd") are NOT evidence of a waterway crossing.** Pathway (P*) features may be added from ODOT sidewalk/bike layers and OSM. Uses `INSERT OR IGNORE` so Phase 1 / Phase 9 rows are never overwritten. The prompt passes each existing feature_id with its B.F.02 location and B.F.03 name (COALESCE plan_value, brm_value) so Claude knows what's already covered. Run after Phase 9 (needs coordinates) and before Phase 2. Costs ~1 API call per bridge. `--debug` prints the full prompt and raw Claude response.
+- **Non-standard feature IDs**: Phase 2 (plan extraction) can occasionally produce feature_ids that don't match the `H##`/`W##`/`R##`/`P##` pattern (e.g. `_CROSSED`). These are DB artifacts — the validation engine skips them, but they should be deleted manually. Check with `SELECT DISTINCT feature_id FROM evidence WHERE bridge_id=? AND feature_id NOT GLOB '[HWRP][0-9]*' AND feature_id NOT IN ('PRIMARY') AND feature_id NOT LIKE 'WORK:%'`.
+- **`brm_col=None` items** (B.N.03, B.N.05, B.N.06 and similar): items with no BrM column source must write derived values to `plan_value/APPROX`, never to `brm_value`. Use the `upsert_approx()` pattern from `08_import_infobridge.py`. Writing to `brm_value` for these items is a bug — it implies a BrM source that doesn't exist.

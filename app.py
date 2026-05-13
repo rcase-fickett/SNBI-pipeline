@@ -84,10 +84,12 @@ def _classify_correction(plan_value, plan_confidence, user_det, status):
 
 def _compute_recommendation(row):
     """Synthesise a recommended value, source tag, and reasoning from AI + BrM data."""
-    conf = row.get('plan_confidence') or ''
-    plan = (row.get('plan_value')    or '').strip()
-    brm  = (row.get('brm_value')     or '').strip()
-    ai_r = (row.get('plan_reasoning')or '').strip()
+    conf    = row.get('plan_confidence') or ''
+    plan    = (row.get('plan_value')    or '').strip()
+    brm     = (row.get('brm_value')     or '').strip()
+    gis     = (row.get('gis_value')     or '').strip()
+    gis_src = (row.get('gis_source')    or '').strip()
+    ai_r    = (row.get('plan_reasoning')or '').strip()
 
     if conf == 'NA':
         return 'N/A', 'na', ai_r or 'Item is not applicable per SNBI spec.'
@@ -96,6 +98,8 @@ def _compute_recommendation(row):
     if plan and conf in ('HIGH', 'APPROX'):
         src = 'plan-high' if conf == 'HIGH' else 'plan-approx'
         return plan, src, ai_r
+    if gis:
+        return gis, 'gis', gis_src or 'GIS pre-fill.'
     if brm:
         if conf == 'PENDING' and not plan:
             reason = (f"No value found in plan drawings; AI extraction returned no result. "
@@ -940,6 +944,43 @@ def complete_review(bridge_id):
     return jsonify({"ok": True})
 
 
+# ── Reseed features from GIS (Phase 11) ──────────────────────────────────────
+
+@app.route("/api/bridge/<bridge_id>/reseed-gis", methods=["POST"])
+def reseed_features_gis(bridge_id):
+    """Re-run Phase 11 AI feature discovery for a single bridge using GIS data only."""
+    import sys as _sys
+    import os as _os
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    try:
+        from discover_features_ai_11 import reseed_bridge_gis
+    except ImportError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "discover_features_ai_11",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "11_discover_features_ai.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        reseed_bridge_gis = mod.reseed_bridge_gis
+
+    data    = request.get_json() or {}
+    api_key = (data.get("api_key") or "").strip() or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    conn = get_db()
+    result = reseed_bridge_gis(conn, bridge_id, api_key=api_key)
+    conn.close()
+
+    if result.get("error"):
+        return jsonify({"ok": False, "error": result["error"]}), 500
+    return jsonify({
+        "ok": True,
+        "features_added": result["features_added"],
+        "rows_inserted":  result["rows_inserted"],
+    })
+
+
 # ── Feedback (correction import + lesson build) ───────────────────────────────
 
 @app.route("/api/feedback/start", methods=["POST"])
@@ -960,6 +1001,217 @@ def api_feedback_start():
 def api_feedback_status():
     with _fb_lock:
         return jsonify(dict(_fb_job))
+
+
+# ── SNBI Validation ───────────────────────────────────────────────────────────
+
+_val_job = {
+    "running":   False,
+    "total":     0,
+    "done":      0,
+    "errors":    0,
+    "current":   "",
+    "log":       [],
+    "export_path": None,
+}
+_val_lock = threading.Lock()
+
+
+def _vallog(msg):
+    with _val_lock:
+        _val_job["log"].append(msg)
+        if len(_val_job["log"]) > 500:
+            _val_job["log"] = _val_job["log"][-500:]
+
+
+@app.route("/api/validate/bridge/<bridge_id>", methods=["POST"])
+def api_validate_bridge(bridge_id):
+    """Run validation for a single bridge, store results, return them."""
+    from lib.validation import validate_bridge as _vb
+    from lib.db import migrate_db
+    migrate_db(DB_PATH)
+    conn = get_db()
+    violations = _vb(conn, bridge_id)
+    # Replace stored results for this bridge
+    conn.execute("DELETE FROM validation_results WHERE bridge_id=?", (bridge_id,))
+    run_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    for v in violations:
+        conn.execute(
+            "INSERT INTO validation_results "
+            "(bridge_id, run_at, severity, rule_name, snbi_id, feature_id, description, explanation) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (bridge_id, run_at, v["severity"], v["rule_name"],
+             v["snbi_id"], v["feature_id"], v["description"], v["explanation"]),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "run_at": run_at, "violations": violations,
+                    "count": len(violations)})
+
+
+@app.route("/api/validate/results/<bridge_id>")
+def api_validate_results(bridge_id):
+    """Return the most recently stored validation results for a bridge."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT severity, rule_name, snbi_id, feature_id, description, explanation, run_at "
+        "FROM validation_results WHERE bridge_id=? ORDER BY "
+        "CASE severity WHEN 'Safety' THEN 0 WHEN 'Critical' THEN 1 "
+        "WHEN 'Error' THEN 2 WHEN 'Flag' THEN 3 ELSE 4 END, snbi_id, feature_id",
+        (bridge_id,)
+    ).fetchall()
+    run_at = rows[0]["run_at"] if rows else None
+    conn.close()
+    return jsonify({"violations": [dict(r) for r in rows], "run_at": run_at})
+
+
+def _run_validation_export(bridge_ids):
+    """Background job: validate all selected bridges and write Excel to Downloads."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from lib.validation import validate_bridge as _vb
+    from lib.db import get_conn as _gc, migrate_db
+
+    migrate_db(DB_PATH)
+    conn = _gc(DB_PATH)
+
+    SEV_COLORS = {
+        "Safety":   ("CC0000", "FFFFFF"),
+        "Critical": ("E05252", "FFFFFF"),
+        "Error":    ("F59E0B", "1E293B"),
+        "Flag":     ("6366F1", "FFFFFF"),
+    }
+
+    wb  = openpyxl.Workbook()
+    ws  = wb.active
+    ws.title = "SNBI Validation"
+
+    # Header row
+    headers = ["Bridge ID", "Bridge Name", "Severity", "SNBI Item",
+               "Feature", "Rule", "Description", "Explanation"]
+    for col, hdr in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=hdr)
+        cell.font      = Font(bold=True, color="FFFFFF")
+        cell.fill      = PatternFill("solid", fgColor="1E3A5F")
+        cell.alignment = Alignment(wrap_text=True)
+
+    col_widths = [12, 24, 10, 12, 10, 16, 60, 50]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+    ws.row_dimensions[1].height = 20
+
+    run_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    data_row = 2
+    total_violations = 0
+
+    with _val_lock:
+        _val_job.update(total=len(bridge_ids), done=0, errors=0,
+                        current="", log=[], export_path=None)
+
+    for bid in bridge_ids:
+        with _val_lock:
+            _val_job["current"] = bid
+        try:
+            bridge_row = conn.execute(
+                "SELECT bridge_name FROM bridges WHERE bridge_id=?", (bid,)
+            ).fetchone()
+            bname = bridge_row["bridge_name"] if bridge_row else ""
+
+            violations = _vb(conn, bid)
+
+            # Store results in DB
+            conn.execute("DELETE FROM validation_results WHERE bridge_id=?", (bid,))
+            for v in violations:
+                conn.execute(
+                    "INSERT INTO validation_results "
+                    "(bridge_id, run_at, severity, rule_name, snbi_id, "
+                    "feature_id, description, explanation) VALUES (?,?,?,?,?,?,?,?)",
+                    (bid, run_at, v["severity"], v["rule_name"],
+                     v["snbi_id"], v["feature_id"],
+                     v["description"], v["explanation"]),
+                )
+
+            for v in violations:
+                bg, fg = SEV_COLORS.get(v["severity"], ("FFFFFF", "000000"))
+                sev_cell = ws.cell(row=data_row, column=3, value=v["severity"])
+                sev_cell.fill = PatternFill("solid", fgColor=bg)
+                sev_cell.font = Font(bold=True, color=fg)
+
+                ws.cell(row=data_row, column=1, value=bid)
+                ws.cell(row=data_row, column=2, value=bname)
+                ws.cell(row=data_row, column=4, value=v["snbi_id"])
+                ws.cell(row=data_row, column=5, value=v["feature_id"])
+                ws.cell(row=data_row, column=6, value=v["rule_name"])
+                ws.cell(row=data_row, column=7, value=v["description"])
+                cell_expl = ws.cell(row=data_row, column=8, value=v["explanation"])
+                cell_expl.alignment = Alignment(wrap_text=True)
+                data_row      += 1
+                total_violations += 1
+
+            if violations:
+                _vallog(f"[{bid}] {len(violations)} violation(s)")
+            conn.commit()
+
+        except Exception as exc:
+            with _val_lock:
+                _val_job["errors"] += 1
+            _vallog(f"[{bid}] ERROR: {exc}")
+
+        with _val_lock:
+            _val_job["done"] += 1
+
+    conn.close()
+
+    # Summary sheet
+    ws_sum         = wb.create_sheet("Summary", 0)
+    ws_sum["A1"]   = "SNBI Validation Export"
+    ws_sum["A1"].font = Font(bold=True, size=14)
+    ws_sum["A2"]   = f"Generated: {run_at} UTC"
+    ws_sum["A3"]   = f"Bridges checked: {len(bridge_ids)}"
+    ws_sum["A4"]   = f"Total violations: {total_violations}"
+
+    # Write to Downloads
+    downloads = Path.home() / "Downloads"
+    downloads.mkdir(exist_ok=True)
+    ts        = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    out_path  = downloads / f"SNBI_Validation_{ts}.xlsx"
+    wb.save(str(out_path))
+
+    with _val_lock:
+        _val_job["running"]     = False
+        _val_job["export_path"] = str(out_path)
+    _vallog(f"✓ Export saved: {out_path.name}")
+
+
+@app.route("/api/validate/export", methods=["POST"])
+def api_validate_export():
+    """Start a background validation + Excel export job."""
+    with _val_lock:
+        if _val_job["running"]:
+            return jsonify({"ok": False, "error": "Validation job already running"})
+    data       = request.get_json() or {}
+    bridge_ids = data.get("bridge_ids", [])
+    if not bridge_ids:
+        # Default to all bridges
+        conn = get_db()
+        bridge_ids = [r[0] for r in conn.execute(
+            "SELECT bridge_id FROM bridges ORDER BY bridge_id"
+        ).fetchall()]
+        conn.close()
+    if not bridge_ids:
+        return jsonify({"ok": False, "error": "No bridges found"})
+    with _val_lock:
+        _val_job.update(running=True, total=len(bridge_ids), done=0,
+                        errors=0, current="", log=[], export_path=None)
+    threading.Thread(target=_run_validation_export, args=(bridge_ids,),
+                     daemon=True).start()
+    return jsonify({"ok": True, "total": len(bridge_ids)})
+
+
+@app.route("/api/validate/status")
+def api_validate_status():
+    with _val_lock:
+        return jsonify(dict(_val_job))
 
 
 if __name__ == "__main__":
@@ -986,7 +1238,7 @@ if __name__ == "__main__":
         except Exception:
             lan_ip = "<this-machine-ip>"
         print(f"  Local    : http://localhost:{args.port}")
-        print(f"  Network  : http://{lan_ip}:{args.port}  ← share this with your team")
+        print(f"  Network  : http://{lan_ip}:{args.port}  <- share this with your team")
     else:
         print(f"  Open     : http://localhost:{args.port}")
     print()

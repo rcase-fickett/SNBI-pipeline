@@ -61,38 +61,38 @@ def is_carried(conn, bridge_id, feature_id):
 
 
 def enrich_f03(conn, bridge_id, feature_id, gis_name, source, dry_run):
-    """Write B.F.03 plan_value with GIS name if plan_value is currently null."""
+    """Write B.F.03 gis_value with GIS name if gis_value is currently null."""
     if not gis_name:
         return False
     row = conn.execute(
-        "SELECT id, plan_value FROM evidence "
+        "SELECT id, gis_value FROM evidence "
         "WHERE bridge_id=? AND item_id='B.F.03' AND feature_id=?",
         (bridge_id, feature_id)
     ).fetchone()
-    if not row or row["plan_value"]:
+    if not row or row["gis_value"]:
         return False
     if not dry_run:
         conn.execute(
-            "UPDATE evidence SET plan_value=?, plan_confidence='APPROX', "
-            "brm_source_col=?, updated_at=datetime('now') WHERE id=?",
+            "UPDATE evidence SET gis_value=?, gis_source=?, "
+            "updated_at=datetime('now') WHERE id=?",
             (gis_name, source, row["id"])
         )
     return True
 
 
 def fill_rr01(conn, bridge_id, feature_id, service_type, dry_run):
-    """Write B.RR.01 brm_value if null. Returns 'inserted', 'updated', or None."""
+    """Write B.RR.01 gis_value if null. Returns 'inserted', 'updated', or None."""
     row = conn.execute(
-        "SELECT id, brm_value FROM evidence "
+        "SELECT id, gis_value FROM evidence "
         "WHERE bridge_id=? AND item_id='B.RR.01' AND feature_id=?",
         (bridge_id, feature_id)
     ).fetchone()
     if row:
-        if row["brm_value"]:
+        if row["gis_value"]:
             return None
         if not dry_run:
             conn.execute(
-                "UPDATE evidence SET brm_value=?, brm_source_col=?, "
+                "UPDATE evidence SET gis_value=?, gis_source=?, "
                 "updated_at=datetime('now') WHERE id=?",
                 (service_type, GIS_SOURCE, row["id"])
             )
@@ -102,8 +102,8 @@ def fill_rr01(conn, bridge_id, feature_id, service_type, dry_run):
             item = ITEM_BY_ID.get("B.RR.01", {})
             conn.execute(
                 "INSERT OR IGNORE INTO evidence "
-                "(bridge_id, item_id, feature_id, item_name, brm_value, "
-                "brm_source_col, plan_confidence, status) "
+                "(bridge_id, item_id, feature_id, item_name, gis_value, "
+                "gis_source, plan_confidence, status) "
                 "VALUES (?,?,?,?,?,?,'APPROX','PENDING')",
                 (bridge_id, "B.RR.01", feature_id,
                  item.get("name", "Railroad Service Type"),
@@ -113,38 +113,38 @@ def fill_rr01(conn, bridge_id, feature_id, service_type, dry_run):
 
 
 def get_bf03_value(conn, bridge_id, feature_id):
-    """Return the best available B.F.03 value (plan_value preferred, then brm_value)."""
+    """Return the best available B.F.03 value (plan_value > gis_value > brm_value)."""
     row = conn.execute(
-        "SELECT plan_value, brm_value FROM evidence "
+        "SELECT plan_value, gis_value, brm_value FROM evidence "
         "WHERE bridge_id=? AND item_id='B.F.03' AND feature_id=?",
         (bridge_id, feature_id)
     ).fetchone()
     if not row:
         return ""
-    return (row["plan_value"] or row["brm_value"] or "").strip()
+    return (row["plan_value"] or row["gis_value"] or row["brm_value"] or "").strip()
 
 
 def fill_bh08(conn, bridge_id, feature_id, lanes, source, dry_run, force=False):
     """
-    Write B.H.08 brm_value. Returns True if written.
+    Write B.H.08 gis_value. Returns True if written.
 
     Normally only fills null values. Pass force=True for GIS-split highways: when a
     single BrM/InfoBridge feature has been divided into multiple directional carriageways
-    by GIS, the BrM total-lane count is wrong for each individual feature and must be
-    replaced with the per-carriageway GIS value.
+    by GIS, the BrM total-lane count is wrong per-feature and must be replaced with the
+    per-carriageway GIS value.
     """
     row = conn.execute(
-        "SELECT id, brm_value FROM evidence "
+        "SELECT id, gis_value FROM evidence "
         "WHERE bridge_id=? AND item_id='B.H.08' AND feature_id=?",
         (bridge_id, feature_id)
     ).fetchone()
     if not row:
         return False
-    if not force and row["brm_value"]:
+    if not force and row["gis_value"]:
         return False
     if not dry_run:
         conn.execute(
-            "UPDATE evidence SET brm_value=?, brm_source_col=?, "
+            "UPDATE evidence SET gis_value=?, gis_source=?, "
             "updated_at=datetime('now') WHERE id=?",
             (str(lanes), source, row["id"])
         )

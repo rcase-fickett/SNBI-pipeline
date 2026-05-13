@@ -16,6 +16,7 @@
       {% if show_feature %}<th style="width:62px">Feature</th>{% endif %}
       <th style="min-width:110px">Name</th>
       <th style="min-width:70px">BrM</th>
+      <th style="min-width:70px">GIS</th>
       <th style="min-width:80px">Plan Value</th>
       <th style="width:68px">Conf</th>
       <th style="min-width:120px">AI Recommendation</th>
@@ -61,13 +62,14 @@
           </td>
         </tr>
       {% endif %}
-      <tr data-id="{{ row.id }}" data-recommendation="{{ row.ai_recommendation or '' }}">
+      <tr data-id="{{ row.id }}" data-item-id="{{ row.item_id }}" data-feature-id="{{ row.feature_id }}" data-recommendation="{{ row.ai_recommendation or '' }}">
         <td><span class="mono" style="font-size:12px;font-weight:600">{{ row.item_id }}</span></td>
         {% if show_feature %}
         <td><span style="font-size:11px;color:#64748b">{{ row.feature_id }}</span></td>
         {% endif %}
         <td style="font-size:12px">{{ row.item_name or '' }}</td>
         <td><span class="mono" style="font-size:12px;color:#94a3b8">{{ row.brm_value or '—' }}</span></td>
+        <td><span class="mono" style="font-size:12px;color:#0891b2">{{ row.gis_value or '—' }}</span></td>
         <td><span class="mono" style="font-size:12px;color:#64748b">{{ row.plan_value or '—' }}</span></td>
         <td><span class="badge badge-{{ row.plan_confidence }}">
           {%- if row.plan_confidence == 'NOT_FOUND' -%}—{%- else -%}{{ row.plan_confidence }}{%- endif -%}
@@ -80,6 +82,7 @@
           <span class="rec-tag rec-{{ row.rec_source }}">
             {%- if row.rec_source == 'plan-high' %}Plan
             {%- elif row.rec_source == 'plan-approx' %}~Plan
+            {%- elif row.rec_source == 'gis' %}GIS
             {%- elif row.rec_source == 'brm' %}BrM
             {%- elif row.rec_source == 'field' %}Field
             {%- elif row.rec_source == 'na' %}N/A
@@ -205,6 +208,12 @@
       </div>
 
       <a href="/review" class="btn btn-ghost btn-sm" style="margin-left:auto">← Queue</a>
+
+      <button id="btn-reseed-gis" class="btn btn-sm" onclick="reseedFeaturesGis()"
+              style="background:#e0f2fe;color:#0369a1;border:1px solid #7dd3fc"
+              title="Re-run Phase 11 AI feature discovery from GIS data">
+        ↺ Reseed Features (GIS)
+      </button>
 
       {% if bridge.processing_status in ('REVIEW_DONE', 'COMPLETE') %}
       <span class="btn btn-sm" style="background:#dcfce7;color:#15803d;border:1px solid #86efac;cursor:default">
@@ -426,6 +435,7 @@
       <div style="display:flex;gap:2px;flex-shrink:0">
         <button class="panel-tab active" id="tab-pdf" onclick="showTab('pdf')">PDF</button>
         <button class="panel-tab" id="tab-map" onclick="showTab('map')">Map</button>
+        <button class="panel-tab" id="tab-validate" onclick="showTab('validate')">SNBI Validation</button>
       </div>
       <span class="pdf-title" id="pdf-source-label" style="margin-left:.5rem">Plans PDF</span>
       <div id="zoom-controls" style="display:flex;align-items:center;gap:4px;flex-shrink:0">
@@ -458,6 +468,18 @@
 
     <div id="map-body" style="flex:1;display:none;min-height:0;position:relative">
       <div id="map-view" style="width:100%;height:100%"></div>
+    </div>
+
+    <!-- SNBI Validation tab body -->
+    <div id="validate-body" style="flex:1;display:none;min-height:0;overflow-y:auto;padding:1rem">
+      <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
+        <button id="btn-run-validate" class="btn btn-primary" onclick="runValidation()">
+          ▶ Run Validation
+        </button>
+        <span id="validate-spinner" style="display:none;color:#64748b;font-size:13px">Running…</span>
+        <span id="validate-run-at" style="font-size:11px;color:#94a3b8"></span>
+      </div>
+      <div id="validate-results"></div>
     </div>
   </div>
 
@@ -573,6 +595,28 @@ document.getElementById('pdf-body').addEventListener('wheel', function(e) {
   });
 })();
 
+// ── Reseed features from GIS ──────────────────────────────────
+async function reseedFeaturesGis() {
+  const btn = document.getElementById('btn-reseed-gis');
+  btn.disabled = true;
+  btn.textContent = '↺ Reseeding…';
+  try {
+    const res = await api(`/api/bridge/${BRIDGE}/reseed-gis`, {});
+    if (res.ok) {
+      const msg = res.features_added
+        ? `Added ${res.features_added} feature(s), ${res.rows_inserted} row(s). Reloading…`
+        : 'No new features found.';
+      toast(msg);
+      if (res.features_added) setTimeout(() => location.reload(), 1500);
+    } else {
+      toast(res.error || 'Reseed failed', 'err');
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↺ Reseed Features (GIS)';
+  }
+}
+
 // ── Mark review complete ──────────────────────────────────────
 async function completeReview() {
   if (!confirm('Mark this bridge review as complete?\n\nThis will flag it as ready to send feedback to the AI.')) return;
@@ -613,6 +657,11 @@ async function setStatus(id, tr, status) {
     if (b) { b.className = `badge badge-st-${status} status-badge`; b.textContent = status; }
     const labels = { CORRECT: 'Correct', PARTIAL: 'Partial', INCORRECT: 'Incorrect' };
     toast(labels[status] || status);
+    // Marking INCORRECT clears the red validation highlight immediately
+    if (status === 'INCORRECT') {
+      tr.style.borderLeft      = '';
+      tr.style.backgroundColor = '';
+    }
   } else { toast('Error', 'err'); }
 }
 
@@ -644,17 +693,151 @@ function highlightBridgeLog() {
 
 // ── Tab switching ─────────────────────────────────────────────
 function showTab(tab) {
-  const isPdf = tab === 'pdf';
-  document.getElementById('pdf-body').style.display        = isPdf ? 'flex' : 'none';
-  document.getElementById('pdf-nav').style.display         = isPdf ? 'flex' : 'none';
-  document.getElementById('zoom-controls').style.display   = isPdf ? 'flex' : 'none';
-  document.getElementById('pdf-source-label').style.display = isPdf ? 'block' : 'none';
-  document.getElementById('map-body').style.display        = isPdf ? 'none'  : 'flex';
-  document.getElementById('tab-pdf').classList.toggle('active',  isPdf);
-  document.getElementById('tab-map').classList.toggle('active', !isPdf);
-  if (!isPdf) {
+  const isPdf      = tab === 'pdf';
+  const isMap      = tab === 'map';
+  const isValidate = tab === 'validate';
+  document.getElementById('pdf-body').style.display         = isPdf      ? 'flex'  : 'none';
+  document.getElementById('pdf-nav').style.display          = isPdf      ? 'flex'  : 'none';
+  document.getElementById('zoom-controls').style.display    = isPdf      ? 'flex'  : 'none';
+  document.getElementById('pdf-source-label').style.display = isPdf      ? 'block' : 'none';
+  document.getElementById('map-body').style.display         = isMap      ? 'flex'  : 'none';
+  document.getElementById('validate-body').style.display    = isValidate ? 'flex'  : 'none';
+  document.getElementById('tab-pdf').classList.toggle('active',      isPdf);
+  document.getElementById('tab-map').classList.toggle('active',      isMap);
+  document.getElementById('tab-validate').classList.toggle('active', isValidate);
+  if (isMap) {
     if (!_mapReady) initMap();
     else setTimeout(() => _leafletMap && _leafletMap.invalidateSize(), 50);
+  }
+  if (isValidate && !_validateLoaded) loadValidationResults();
+}
+
+// ── SNBI Validation ───────────────────────────────────────────
+let _validateLoaded = false;
+
+const SEV_STYLES = {
+  Safety:   { bg: '#CC0000', fg: '#fff', label: '⛔ Safety'   },
+  Critical: { bg: '#E05252', fg: '#fff', label: '🔴 Critical' },
+  Error:    { bg: '#F59E0B', fg: '#1e293b', label: '🟠 Error' },
+  Flag:     { bg: '#6366F1', fg: '#fff', label: '🔵 Flag'     },
+};
+
+function renderValidation(violations, runAt) {
+  _validateLoaded = true;
+  const el = document.getElementById('validate-results');
+  const ts = document.getElementById('validate-run-at');
+  ts.textContent = runAt ? `Last run: ${runAt} UTC` : '';
+
+  if (!violations || violations.length === 0) {
+    el.innerHTML = '<div style="color:#16a34a;font-weight:600;font-size:14px;padding:.5rem 0">'
+      + '✓ No validation violations found.</div>';
+    return;
+  }
+
+  // Group by severity
+  const groups = {};
+  for (const v of violations) {
+    if (!groups[v.severity]) groups[v.severity] = [];
+    groups[v.severity].push(v);
+  }
+
+  let html = `<div style="font-size:12px;color:#64748b;margin-bottom:.75rem">`
+    + `${violations.length} violation(s) found</div>`;
+
+  const order = ['Safety','Critical','Error','Flag'];
+  for (const sev of order) {
+    const list = groups[sev];
+    if (!list) continue;
+    const st = SEV_STYLES[sev] || { bg:'#94a3b8', fg:'#fff', label: sev };
+    html += `<div style="margin-bottom:1rem">
+      <div style="background:${st.bg};color:${st.fg};font-weight:700;font-size:12px;
+                  padding:4px 8px;border-radius:4px 4px 0 0">${st.label} — ${list.length}</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="background:#f1f5f9;color:#475569">
+            <th style="padding:4px 8px;text-align:left;white-space:nowrap;width:80px">Item</th>
+            <th style="padding:4px 8px;text-align:left;width:60px">Feature</th>
+            <th style="padding:4px 8px;text-align:left">Description</th>
+            <th style="padding:4px 8px;text-align:left;color:#64748b">Explanation</th>
+          </tr>
+        </thead>
+        <tbody>`;
+    for (const v of list) {
+      const hasRow = v.snbi_id && v.feature_id !== undefined;
+      html += `<tr style="border-top:1px solid #e2e8f0${hasRow ? ';cursor:pointer' : ''}"
+               ${hasRow ? `onclick="scrollToEvidenceRow('${v.snbi_id}','${v.feature_id}')" title="Click to jump to this item in the evidence table"` : ''}>
+        <td style="padding:4px 8px;font-family:monospace;white-space:nowrap">${v.snbi_id || ''}</td>
+        <td style="padding:4px 8px;font-family:monospace;color:#475569">${v.feature_id || ''}</td>
+        <td style="padding:4px 8px">${v.description}</td>
+        <td style="padding:4px 8px;color:#64748b;font-size:11px">${v.explanation || ''}</td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+  el.innerHTML = html;
+}
+
+// ── Click violation → scroll to evidence row ──────────────────
+function scrollToEvidenceRow(itemId, featureId) {
+  const tr = document.querySelector(
+    `tr[data-item-id="${CSS.escape(itemId)}"][data-feature-id="${CSS.escape(featureId)}"]`
+  );
+  if (!tr) return;
+  tr.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  // Flash yellow, then restore original colour
+  const prev = tr.style.backgroundColor;
+  tr.style.transition = 'background-color 0.05s';
+  tr.style.backgroundColor = '#fef08a';
+  setTimeout(() => {
+    tr.style.transition = 'background-color 1s';
+    tr.style.backgroundColor = prev;
+  }, 700);
+}
+
+// ── Validation row highlights ─────────────────────────────────
+function applyValidationHighlights(violations) {
+  // Build lookup: "item_id|feature_id" for every violation
+  const bad = new Set((violations || []).map(v => `${v.snbi_id}|${v.feature_id}`));
+  document.querySelectorAll('tr[data-item-id]').forEach(tr => {
+    const key = `${tr.dataset.itemId}|${tr.dataset.featureId}`;
+    if (bad.has(key)) {
+      tr.style.borderLeft      = '3px solid #dc2626';
+      tr.style.backgroundColor = '#fee2e2';
+    } else {
+      tr.style.borderLeft      = '';
+      tr.style.backgroundColor = '';
+    }
+  });
+}
+
+async function loadValidationResults() {
+  try {
+    const data = await fetch(`/api/validate/results/${encodeURIComponent(BRIDGE)}`).then(r=>r.json());
+    renderValidation(data.violations, data.run_at);
+    applyValidationHighlights(data.violations);
+  } catch(e) {
+    document.getElementById('validate-results').innerHTML =
+      '<span style="color:#94a3b8;font-size:12px">No validation results yet. Click Run Validation.</span>';
+  }
+}
+
+async function runValidation() {
+  const btn = document.getElementById('btn-run-validate');
+  const spin = document.getElementById('validate-spinner');
+  btn.disabled = true;
+  spin.style.display = 'inline';
+  document.getElementById('validate-results').innerHTML = '';
+  try {
+    const data = await fetch(`/api/validate/bridge/${encodeURIComponent(BRIDGE)}`,
+      { method: 'POST' }).then(r => r.json());
+    renderValidation(data.violations, data.run_at);
+    applyValidationHighlights(data.violations);
+  } catch(e) {
+    document.getElementById('validate-results').innerHTML =
+      `<span style="color:#ef4444">Error running validation: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+    spin.style.display = 'none';
   }
 }
 
@@ -973,6 +1156,14 @@ function addShotThumb(evidenceId, shot) {
   wrap.appendChild(del);
   gallery.appendChild(wrap);
 }
+
+// Silently load validation highlights on page load (no tab open required)
+(async function initValidationHighlights() {
+  try {
+    const data = await fetch(`/api/validate/results/${encodeURIComponent(BRIDGE)}`).then(r=>r.json());
+    if (data.violations && data.violations.length) applyValidationHighlights(data.violations);
+  } catch(e) {}
+})();
 
 // Load existing screenshots for all evidence rows on page load
 (async function loadAllScreenshots() {

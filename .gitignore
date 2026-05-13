@@ -25,3 +25,14 @@ static/screenshots/
 # OS
 .DS_Store
 Thumbs.db
+
+# App logs and InfoBridge export files
+app_out.txt
+app_err.txt
+Selected_Bridges_*.txt
+
+# Claude Code internal directory (worktrees, plans)
+.claude/
+
+# OneDrive conflict copies
+*-FICKETT-*.html

@@ -143,6 +143,23 @@ def build_context_block(lat, lon):
         lines.append("  Nearby roads (ODOT road network):")
         lines.append(f"    {', '.join(roads)}")
 
+    # Travel lane counts from ODOT road inventory — authoritative for B.H.08
+    lane_counts = query_lane_counts(lat, lon, radius_m=75)
+    if lane_counts:
+        # Group by hwynumb; take max lanes per route (mainline > ramps)
+        by_route = {}
+        for lc in lane_counts:
+            key = lc["hwynumb"] or "(local)"
+            by_route[key] = max(by_route.get(key, 0), lc["no_lanes"])
+        summaries = []
+        for route, n in sorted(by_route.items()):
+            label = f"Hwy {route}" if route != "(local)" else "Local road"
+            summaries.append(f"{label}: {n} lanes")
+        lines.append(
+            "  ODOT travel lane counts (authoritative for B.H.08 — use these values, "
+            "do not infer from roadway width): " + "; ".join(summaries)
+        )
+
     lines.append(
         "  Use CARRIES/CROSSES fields to identify the facility carried and "
         "feature intersected. Match bridge IDs against the bridge_id being processed."
@@ -204,6 +221,171 @@ def query_lane_counts(lat, lon, radius_m=75):
             results.append({"no_lanes": lanes, "hwynumb": "", "roadway_id": None})
 
     return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# B.F.03 name builder
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _rte_priority(r):
+    """Sort key: Interstate < US < State < other (most recognizable first)."""
+    r = r.upper()
+    if r.startswith("I-") or r.startswith("I "):    return 0
+    if r.startswith("US-") or r.startswith("US "):   return 1
+    if r.startswith("OR-") or r.startswith("OR ") or r.startswith("SR-"): return 2
+    return 3
+
+
+def _is_route_desig(part):
+    """Return True if a B.F.03 pipe segment looks like a route designation vs. a common name."""
+    p = part.strip().upper()
+    return (p.startswith("I-") or p.startswith("I ")
+            or p.startswith("US-") or p.startswith("US ")
+            or p.startswith("OR-") or p.startswith("OR ")
+            or p.startswith("SR-") or p.startswith("CR-")
+            or bool(_re.match(r'^[A-Z]{1,3}\s*\d', p)))
+
+
+def f03_with_direction(base_name, direction):
+    """
+    Append a direction suffix (NB/SB/EB/WB) to route designations in a pipe-delimited
+    B.F.03 base name, leaving the common/official name components unchanged.
+
+    Example: f03_with_direction("I-205|East Portland Freeway", "NB")
+             → "I-205 NB|East Portland Freeway"
+    """
+    if not direction or not base_name:
+        return base_name
+    parts = [p.strip() for p in base_name.split("|")]
+    result = []
+    for p in parts:
+        result.append(f"{p} {direction}" if _is_route_desig(p) else p)
+    return "|".join(result)
+
+
+def build_f03_name(hwynumb, lat, lon, fallback_text, radius_m=300):
+    """
+    Build a proper SNBI B.F.03 base name for a highway feature.
+
+    Queries ODOT layer 166 (signed routes) filtered by HWYNUMB to find:
+      - ALL_RTE: signed route designation(s) like "I-205"
+      - HWYNAME: official highway name like "EAST PORTLAND FREEWAY"
+      - ROAD_NAME: local/common road name if present
+
+    Returns pipe-delimited name with route numbers first (sorted I > US > OR > other),
+    then common name, e.g. "I-205|East Portland Freeway".
+    Falls back to fallback_text if no HWYNUMB or no layer 166 data found.
+    """
+    if not hwynumb:
+        return (fallback_text or "").strip()
+
+    hwynumb_padded = hwynumb.zfill(3)
+    feats = _query_layer(
+        166, lat, lon, radius_m,
+        "ALL_RTE,HWYNAME,ST_HWY_SFX,ROAD_NAME",
+        where=f"HWYNUMB='{hwynumb_padded}'",
+    )
+    if not feats:
+        return (fallback_text or f"Hwy {hwynumb}").strip()
+
+    route_desigs = []
+    hwyname      = ""
+    road_name    = ""
+
+    for f in feats:
+        a   = f.get("attributes", {})
+        rte = (a.get("ALL_RTE") or "").strip()
+        if rte and rte not in route_desigs:
+            route_desigs.append(rte)
+        sfx = (a.get("ST_HWY_SFX") or "").strip()
+        if not hwyname and sfx == "00":
+            hwyname = " ".join(w.capitalize() for w in
+                               (a.get("HWYNAME") or "").strip().split())
+        if not road_name:
+            rn = " ".join(w.capitalize() for w in
+                          (a.get("ROAD_NAME") or "").strip().split())
+            if rn:
+                road_name = rn
+
+    # Synthesize SR-{N} from HWYNUMB if not already represented in route_desigs
+    try:
+        sr_num   = str(int(hwynumb))          # "064" → "64"
+        sr_desig = f"SR-{sr_num}"
+        already_covered = any(
+            _re.sub(r'\D', '', r) == sr_num   # exact digit match — avoids SR-5 shadowed by I-205
+            for r in route_desigs
+        )
+        if not already_covered:
+            route_desigs.append(sr_desig)
+    except (ValueError, TypeError):
+        pass
+
+    # Remove any entry whose tokens are fully covered by a longer combined entry.
+    # e.g. ["I-405 US-26", "I-405", "US-26"] → ["I-405 US-26"]
+    route_desigs = [
+        r for r in route_desigs
+        if not any(r != c and set(r.split()) <= set(c.split()) for c in route_desigs)
+    ]
+
+    route_desigs.sort(key=_rte_priority)
+
+    parts = list(route_desigs)
+    # Add official highway name if it adds meaningful context beyond the route designation
+    common = road_name or hwyname
+    if common and common.upper() not in [p.upper() for p in parts]:
+        parts.append(common)
+
+    return "|".join(parts) if parts else (fallback_text or f"Hwy {hwynumb}").strip()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Divided-highway detection helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+# MEDN_CD values that confirm a divided highway (anything beyond painted/mountable)
+_DIVIDED_MEDN_CODES = {4, 5, 6, 7, 8, 9, 10, 11}
+
+import re as _re
+
+def _hwy_num(text):
+    """Extract zero-stripped highway number from ODOT text like 'Hwy 064' or 'Hwy 26'."""
+    m = _re.search(r'[Hh][Ww][Yy]\.?\s*0*(\d+)', text or "")
+    return m.group(1) if m else None
+
+
+def detect_divided(carries_or_crosses, median_features):
+    """
+    Return (is_divided, confirmation_string) by matching the highway number in
+    a CARRIES or CROSSES text against layer 377 median_features.
+
+    Prefers mainline segments (ST_HWY_SFX='00') over connectors/ramps.
+    Uses MEDN_CD >= 4 as the divided threshold (anything beyond painted/mountable).
+    Returns (False, None) if no match or median code is below threshold.
+    """
+    num = _hwy_num(carries_or_crosses)
+    if not num:
+        return False, None
+
+    mainline = None
+    any_match = None
+    for mf in median_features:
+        if mf["hwynumb"].lstrip("0") != num:
+            continue
+        if mf["medn_cd"] not in _DIVIDED_MEDN_CODES:
+            continue
+        if mf["sfx"] == "00":
+            mainline = mf
+            break
+        if any_match is None:
+            any_match = mf
+
+    best = mainline or any_match
+    if not best:
+        return False, None
+
+    road  = best["hwyname"] or f"Hwy {num}"
+    mtype = best["desc"] or f"MEDN_CD={best['medn_cd']}"
+    return True, f"{mtype} median on {road} (ODOT layer 377)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -553,13 +735,41 @@ def gather_feature_context(bridge_id, lat, lon):
             if label not in roads:
                 roads.append(label)
 
-    median_code = None
-    for f in _query_layer(377, lat, lon, 100, "MEDN_CD"):
+    # Collect all median features with road names so build_prompt can match against CARRIES/CROSSES
+    median_features = []
+    seen_hwy = set()
+    for f in _query_layer(377, lat, lon, 150, "MEDN_CD,HWYNAME,HWYNUMB,ST_HWY_SFX,CODE_DESC"):
+        a = f.get("attributes", {})
         try:
-            median_code = int(f.get("attributes", {}).get("MEDN_CD"))
-            break
+            code = int(a.get("MEDN_CD"))
         except (ValueError, TypeError):
-            pass
+            continue
+        hwyname = (a.get("HWYNAME") or "").strip()
+        hwynumb = (a.get("HWYNUMB") or "").strip().lstrip("0")
+        sfx     = (a.get("ST_HWY_SFX") or "").strip()
+        desc    = (a.get("CODE_DESC") or "").strip()
+        key = f"{hwynumb}:{sfx}"
+        if key not in seen_hwy:
+            seen_hwy.add(key)
+            median_features.append({
+                "hwyname":  hwyname,
+                "hwynumb":  hwynumb,
+                "sfx":      sfx,
+                "medn_cd":  code,
+                "desc":     desc,
+            })
+    # Keep backward-compat field for anything that still reads median_code
+    median_code = median_features[0]["medn_cd"] if median_features else None
+
+    # Pre-compute divided-highway determination so build_prompt doesn't rely on Claude guessing
+    carries_divided, carries_divided_reason = detect_divided(carries, median_features)
+    crosses_divided, crosses_divided_reason = detect_divided(crosses, median_features)
+
+    # Pre-build B.F.03 base names using signed-route data (most recognizable name first)
+    carries_hwynumb = _hwy_num(carries)
+    crosses_hwynumb = _hwy_num(crosses)
+    carries_f03_base = build_f03_name(carries_hwynumb, lat, lon, carries)
+    crosses_f03_base = build_f03_name(crosses_hwynumb, lat, lon, crosses)
 
     sidewalk_sides = set()
     for f in _query_layer(132, lat, lon, 150, "ROADSIDE"):
@@ -584,15 +794,26 @@ def gather_feature_context(bridge_id, lat, lon):
 
     osm_features = _query_osm_all_features(lat, lon)
 
+    # Lane counts from ODOT road inventory (layers 126 + 347)
+    lane_counts = query_lane_counts(lat, lon, radius_m=75)
+
     return {
-        "bridge_id":      bridge_id,
-        "carries":        carries,
-        "crosses":        crosses,
-        "route_names":    route_names,
-        "roads":          roads[:10],
-        "median_code":    median_code,
-        "sidewalk_sides": sorted(sidewalk_sides),
-        "bike_types":     sorted(bike_types),
-        "rail_names":     rail_names,
+        "bridge_id":              bridge_id,
+        "carries":                carries,
+        "crosses":                crosses,
+        "carries_f03_base":       carries_f03_base,
+        "crosses_f03_base":       crosses_f03_base,
+        "route_names":            route_names,
+        "roads":                  roads[:10],
+        "median_code":            median_code,
+        "median_features":        median_features,
+        "carries_divided":        carries_divided,
+        "carries_divided_reason": carries_divided_reason,
+        "crosses_divided":        crosses_divided,
+        "crosses_divided_reason": crosses_divided_reason,
+        "sidewalk_sides":         sorted(sidewalk_sides),
+        "bike_types":             sorted(bike_types),
+        "rail_names":             rail_names,
         "osm_features":   osm_features,
+        "lane_counts":    lane_counts,
     }
