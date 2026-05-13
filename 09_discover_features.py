@@ -124,14 +124,23 @@ def get_bf03_value(conn, bridge_id, feature_id):
     return (row["plan_value"] or row["brm_value"] or "").strip()
 
 
-def fill_bh08(conn, bridge_id, feature_id, lanes, source, dry_run):
-    """Write B.H.08 brm_value if currently null. Returns True if written."""
+def fill_bh08(conn, bridge_id, feature_id, lanes, source, dry_run, force=False):
+    """
+    Write B.H.08 brm_value. Returns True if written.
+
+    Normally only fills null values. Pass force=True for GIS-split highways: when a
+    single BrM/InfoBridge feature has been divided into multiple directional carriageways
+    by GIS, the BrM total-lane count is wrong for each individual feature and must be
+    replaced with the per-carriageway GIS value.
+    """
     row = conn.execute(
         "SELECT id, brm_value FROM evidence "
         "WHERE bridge_id=? AND item_id='B.H.08' AND feature_id=?",
         (bridge_id, feature_id)
     ).fetchone()
-    if not row or row["brm_value"]:
+    if not row:
+        return False
+    if not force and row["brm_value"]:
         return False
     if not dry_run:
         conn.execute(
@@ -142,36 +151,56 @@ def fill_bh08(conn, bridge_id, feature_id, lanes, source, dry_run):
     return True
 
 
-def pick_lane_count(gis_lanes, feature_name):
+def pick_lane_entry(gis_lanes, feature_name, exclude_roadway_ids=None):
     """
-    Choose the best lane count from a list of GIS results for a named feature.
+    Return (entry_dict, matched_hwynumb, fallback_used) for the best-matching GIS segment.
 
-    Matching priority:
-      1. HWYNUMB from layer 126 appears anywhere in feature_name (e.g. "22" in "OR-22")
+    Skips entries whose roadway_id is in exclude_roadway_ids so that successive H features
+    on the same divided highway each receive a distinct directional carriageway segment.
+    If exclusion exhausts all candidates the full list is used and fallback_used=True is
+    returned, signalling that the two features may share the same source segment.
+
+    Matching priority (applied to the filtered candidate list):
+      1. HWYNUMB from layer 126 appears anywhere in feature_name
       2. Single unique count → use it regardless of name
-      3. Multiple counts, no match → return the most common count (or first)
+      3. Multiple counts, no name match → most frequent; tie-break smallest
     """
     if not gis_lanes:
-        return None
+        return None, "", False
 
-    # Try HWYNUMB match against the feature route name
+    exclude = exclude_roadway_ids or set()
+    candidates = [
+        e for e in gis_lanes
+        if e.get("roadway_id") is None or e.get("roadway_id") not in exclude
+    ]
+    fallback = False
+    if not candidates:
+        candidates = gis_lanes
+        fallback = True
+
     fname_upper = feature_name.upper()
-    for entry in gis_lanes:
+
+    # Try HWYNUMB match
+    for entry in candidates:
         hwy = entry["hwynumb"]
         if hwy and hwy in fname_upper:
-            return entry["no_lanes"]
+            return entry, hwy, fallback
 
     # Single unique count
-    unique = list({e["no_lanes"] for e in gis_lanes})
-    if len(unique) == 1:
-        return unique[0]
-
-    # Multiple counts — return most frequent; break ties with smallest value
     from collections import Counter
-    freq = Counter(e["no_lanes"] for e in gis_lanes)
+    unique = list({e["no_lanes"] for e in candidates})
+    if len(unique) == 1:
+        return candidates[0], "", fallback
+
+    # Multiple counts — most frequent; tie-break smallest
+    freq = Counter(e["no_lanes"] for e in candidates)
     max_freq = max(freq.values())
-    candidates = sorted(k for k, v in freq.items() if v == max_freq)
-    return candidates[0]
+    best = min(k for k, v in freq.items() if v == max_freq)
+    for entry in candidates:
+        if entry["no_lanes"] == best:
+            return entry, "", fallback
+
+    return candidates[0], "", fallback
 
 
 def add_pathway_feature(conn, bridge_id, feature_id, name, source, dry_run):
@@ -315,13 +344,89 @@ def main():
         if h_fids:
             gis_lanes = query_lane_counts(lat, lon)
             if gis_lanes:
+                # ── Detect GIS-split highways ────────────────────────────────
+                # A highway is "split" if BrM's single feature has been divided
+                # into multiple directional features by GIS (e.g. I-205 NB + SB).
+                # In that case the BrM total-lane count is wrong per-feature and
+                # GIS must override it.
+                #
+                # Two signals, unioned:
+                #   1. GIS returns 2+ distinct RDWY_IDs for the same HWYNUMB
+                #   2. 2+ H features match the same non-empty HWYNUMB
+                from collections import defaultdict, Counter as _Counter
+                rdwy_per_hwy: dict = defaultdict(set)
+                for _e in gis_lanes:
+                    if _e["hwynumb"] and _e.get("roadway_id") is not None:
+                        rdwy_per_hwy[_e["hwynumb"]].add(_e["roadway_id"])
+                split_by_gis = {
+                    hwy for hwy, rids in rdwy_per_hwy.items() if len(rids) > 1
+                }
+
+                # Pre-compute hwy_key for each H feature (no exclusion yet)
+                hwy_keys: dict = {}
                 for fid in h_fids:
-                    fname  = get_bf03_value(conn, bridge_id, fid)
-                    chosen = pick_lane_count(gis_lanes, fname)
-                    if chosen and fill_bh08(conn, bridge_id, fid, chosen, GIS_SOURCE, args.dry_run):
+                    fname = get_bf03_value(conn, bridge_id, fid)
+                    _, hk, _ = pick_lane_entry(gis_lanes, fname)
+                    hwy_keys[fid] = (fname, hk)
+                hk_counts = _Counter(hk for _, hk in hwy_keys.values() if hk)
+                split_by_features = {hk for hk, c in hk_counts.items() if c > 1}
+
+                split_highways = split_by_gis | split_by_features
+
+                # ── Assign per-feature lane counts ───────────────────────────
+                used_per_hwy: dict = {}
+                for fid in h_fids:
+                    fname, hwy_key = hwy_keys[fid]
+                    exclude = used_per_hwy.setdefault(hwy_key, set())
+
+                    entry, _, fallback = pick_lane_entry(gis_lanes, fname,
+                                                         exclude_roadway_ids=exclude)
+                    if not entry:
+                        continue
+
+                    if fallback:
+                        print(f"  [{bridge_id}] {fid} B.H.08 WARN: fallback to "
+                              f"already-used segment (only one {hwy_key!r} segment "
+                              f"within radius) — values may be duplicated")
+
+                    rid = entry.get("roadway_id")
+                    if rid is not None:
+                        exclude.add(rid)
+
+                    chosen = entry["no_lanes"]
+                    force  = hwy_key in split_highways
+                    wrote  = fill_bh08(conn, bridge_id, fid, chosen, GIS_SOURCE,
+                                       args.dry_run, force=force)
+                    if wrote:
                         counts["bh08_written"] += 1
-                        if args.verbose:
-                            print(f"  [{bridge_id}] {fid} B.H.08={chosen}  (GIS, matched '{fname}')")
+                    if args.verbose and wrote:
+                        tag = (" [SPLIT]" if force else "") + (" [FALLBACK]" if fallback else "")
+                        print(f"  [{bridge_id}] {fid} B.H.08={chosen}  "
+                              f"(GIS roadway_id={rid}, matched '{fname}'){tag}")
+
+                    # Write SNBI Errata note to every processed B.H.08 row,
+                    # including ones whose brm_value was already set (e.g. H01).
+                    # Always overwrites — this is a system-generated message that should
+                    # reflect the current GIS state on every Phase 9 run.
+                    if not args.dry_run:
+                        row_id = conn.execute(
+                            "SELECT id FROM evidence "
+                            "WHERE bridge_id=? AND item_id='B.H.08' AND feature_id=?",
+                            (bridge_id, fid)
+                        ).fetchone()
+                        if row_id:
+                            conn.execute(
+                                "UPDATE evidence SET auto_questions=?, "
+                                "updated_at=datetime('now') WHERE id=?",
+                                (
+                                    f"GIS lane count ({chosen}). Per SNBI Errata, verify: "
+                                    f"count only lanes striped or operating as full-width "
+                                    f"traffic lanes (including auxiliary lanes and special use "
+                                    f"lanes) that run the entire length of the bridge. Exclude "
+                                    f"turn lanes or tapers that do not span the full bridge.",
+                                    row_id["id"],
+                                ),
+                            )
 
         # ── Lane-count validation: flag feature-count mismatches ─────────
         # Compare GIS lane count (per road segment) against BrM NBI 28A
