@@ -337,7 +337,9 @@ def _gis_lane_count(feature_name, lane_counts):
     Match a GIS lane count to a feature by route number in its name.
     For state highways: extract digits from name and match to hwynumb.
     For non-state / local roads: use the highest unnamed (hwynumb='') count.
-    Returns int or None. Takes the max count for a route (mainline > ramps).
+    Last resort: max of all counts (safe when query_lane_counts used route-specific mode,
+    so all results are already scoped to the carried route).
+    Returns int or None.
     """
     if not lane_counts:
         return None
@@ -355,11 +357,14 @@ def _gis_lane_count(feature_name, lane_counts):
         if stripped in by_route:
             return by_route[stripped]
 
-    # Fall back to local road count (no hwynumb) — used for carried non-state roads
+    # Non-state road (no hwynumb)
     if "" in by_route:
         return by_route[""]
 
-    return None
+    # Last resort: max of all counts. Safe when route-specific lane count query was used
+    # (all results already filtered to the carried route, so the feature name needn't
+    # contain a route number to get a match — e.g. "SE Johnson Creek Blvd" with no digits).
+    return max(by_route.values()) if by_route else None
 
 
 def seed_features(conn, bridge_id, features, lane_counts, dry_run):
@@ -903,7 +908,28 @@ def run_rename_f03(args):
             brm_text = (r["brm_value"] or "").strip()
             num = _hwy_num(brm_text) or _hwy_num_from_name(base_text)
             if not num:
-                continue  # local road — no highway number to look up
+                # Local/connector road — no highway number to look up via layer 166.
+                # Only applies to H* features; P*/R*/W* use their own naming conventions.
+                fid = r["feature_id"]
+                if not fid.startswith("H"):
+                    continue
+                # Use brm_value as a reliable hint to find the properly-prefixed name in layer 164
+                # (e.g. brm_value="Johnson Creek Blvd" → "SE Johnson Creek Blvd").
+                brm_hint = _DIR_RE.sub("", brm_text).strip() or base_text
+                new_base = _build(None, lat, lon, brm_hint) if brm_hint else ""
+                if not new_base:
+                    continue
+                pass1.append({
+                    "row_id":       r["id"],
+                    "feature_id":   r["feature_id"],
+                    "current":      current,
+                    "existing_gis": (r["gis_value"] or "").strip(),
+                    "direction":    None,
+                    "new_base":     new_base,
+                    "hwynumb":      "",
+                    "location":     (r["location"] or "").strip(),
+                })
+                continue
             # Strip any direction from brm_text before using as fallback — avoids
             # build_f03_name() returning "HWY 91 NB" which then gets NB appended again
             brm_base = _DIR_RE.sub("", brm_text).strip() if brm_text else ""
@@ -984,6 +1010,125 @@ def run_rename_f03(args):
         print("\n  Done.")
 
 
+def run_refresh_lanes(args):
+    """
+    Refresh B.H.08 gis_value for H* features where plan_value IS NULL,
+    using route-specific ODOT lane count queries (layers 126 + HWY_AND_CON).
+
+    For each bridge that has H* features needing B.H.08:
+      1. Look up bridge lat/lon and HWY_AND_CON from ODOT layer 101.
+      2. Call query_lane_counts(hwynumb, sfx) to get the carried route's lanes.
+      3. Match to each H* feature via _gis_lane_count (or max-of-results fallback).
+      4. UPDATE gis_value if it differs from the current value.
+
+    Only updates rows where plan_value IS NULL (plan extraction takes precedence).
+    Supports --bridge, --limit, --dry-run.
+    """
+    from lib.geo_context import query_lane_counts as _qlc, _parse_hwy_and_con, get_bridge_carries_crosses
+
+    conn = get_conn(DB_PATH)
+
+    if args.bridge:
+        bridges = conn.execute(
+            "SELECT bridge_id, lat, lon FROM bridges WHERE bridge_id=?",
+            (args.bridge,)
+        ).fetchall()
+    else:
+        bridges = conn.execute(
+            """SELECT DISTINCT b.bridge_id, b.lat, b.lon
+               FROM bridges b
+               JOIN evidence e ON e.bridge_id = b.bridge_id
+               WHERE e.item_id='B.H.08' AND e.feature_id GLOB 'H[0-9]*'
+               ORDER BY b.bridge_id"""
+        ).fetchall()
+
+    if args.limit:
+        bridges = bridges[:args.limit]
+
+    print("=" * 60)
+    print("  Phase 11: B.H.08 GIS Lane Count Refresh")
+    print("=" * 60)
+    print(f"  Bridges to check   : {len(bridges)}")
+    if args.dry_run:
+        print("  DRY RUN - no changes written\n")
+
+    updated = no_coords = no_lanes = 0
+    label_pfx = "[DRY RUN] " if args.dry_run else ""
+
+    for br in bridges:
+        bridge_id = br["bridge_id"]
+        try:
+            lat, lon = float(br["lat"]), float(br["lon"])
+        except (ValueError, TypeError):
+            no_coords += 1
+            continue
+
+        # Get HWY_AND_CON from layer 101 to determine the carried route and suffix
+        try:
+            _, _, hwy_and_con = get_bridge_carries_crosses(bridge_id)
+            hac_hwynumb, hac_sfx = _parse_hwy_and_con(hwy_and_con)
+        except Exception:
+            hac_hwynumb, hac_sfx = "", ""
+
+        lane_counts = _qlc(lat, lon, hwynumb=hac_hwynumb or None, sfx=hac_sfx or None)
+        if not lane_counts:
+            no_lanes += 1
+            continue
+
+        # Fetch B.H.08 + feature name for carried-on (loc=C) H* features.
+        # When using HWY_AND_CON the route-specific query targets the carried road, so
+        # only carried-on features should be updated. Below-bridge (loc=B) features
+        # represent crossed roads that may have different lane counts.
+        rows = conn.execute(
+            """SELECT e.id, e.feature_id, e.gis_value,
+                      COALESCE(n.plan_value, n.gis_value, n.brm_value) AS feature_name
+               FROM evidence e
+               LEFT JOIN evidence n
+                   ON  n.bridge_id  = e.bridge_id
+                   AND n.feature_id = e.feature_id
+                   AND n.item_id    = 'B.F.03'
+               LEFT JOIN evidence loc
+                   ON  loc.bridge_id  = e.bridge_id
+                   AND loc.feature_id = e.feature_id
+                   AND loc.item_id    = 'B.F.02'
+               WHERE e.bridge_id=? AND e.item_id='B.H.08'
+                 AND e.feature_id GLOB 'H[0-9]*'
+                 AND COALESCE(loc.plan_value, loc.gis_value, loc.brm_value) = 'C'""",
+            (bridge_id,)
+        ).fetchall()
+
+        for row in rows:
+            new_count = _gis_lane_count(row["feature_name"] or "", lane_counts)
+            if new_count is None:
+                continue
+            new_val = str(new_count)
+            if new_val == (row["gis_value"] or "").strip():
+                continue
+            print(f"  {label_pfx}[{bridge_id}] {row['feature_id']} B.H.08: "
+                  f"'{row['gis_value'] or '(none)'}' → '{new_val}'")
+            if not args.dry_run:
+                conn.execute(
+                    "UPDATE evidence SET gis_value=?, gis_source=?, updated_at=datetime('now') "
+                    "WHERE id=?",
+                    (new_val,
+                     "ODOT TransGIS layer 126 (11_discover_features_ai --refresh-lanes)",
+                     row["id"]),
+                )
+            updated += 1
+
+    if not args.dry_run:
+        conn.commit()
+    conn.close()
+
+    print(f"\n  No coordinates       : {no_coords}")
+    print(f"  No GIS lane data     : {no_lanes}")
+    print(f"  B.H.08 rows updated  : {updated}")
+    if args.dry_run:
+        print("\n  Dry run — run without --dry-run to apply.")
+    else:
+        print("\n  Done.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Phase 11: AI feature discovery from GIS data"
@@ -1006,6 +1151,8 @@ def main():
                         help="Update B.F.03 gis_values using GIS-derived names (no API call)")
     parser.add_argument("--reseed-divided",  action="store_true",
                         help="Reseed bridges with divided highways missing an H feature (uses Claude API)")
+    parser.add_argument("--refresh-lanes",   action="store_true",
+                        help="Refresh B.H.08 gis_values using route-specific ODOT lane count queries (no API call)")
     args = parser.parse_args()
     if args.backfill:
         run_backfill(args)
@@ -1013,6 +1160,8 @@ def main():
         run_rename_f03(args)
     elif args.reseed_divided:
         run_reseed_divided(args)
+    elif args.refresh_lanes:
+        run_refresh_lanes(args)
     else:
         run(args)
 

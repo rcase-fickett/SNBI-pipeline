@@ -167,58 +167,91 @@ def build_context_block(lat, lon):
     return "\n".join(lines)
 
 
-def query_lane_counts(lat, lon, radius_m=75):
+def query_lane_counts(lat, lon, radius_m=75, hwynumb=None, sfx=None):
     """
     Query ODOT TransGIS layers 126 (state roads) and 347 (non-state roads) for
     travel lane counts at a bridge location.
 
-    Returns list of {"no_lanes": int, "hwynumb": str, "roadway_id": str|None} dicts,
-    state-road results first (layer 126 has HWYNUMB and RDWY_ID for per-carriageway
-    matching), then non-state (layer 347, roadway_id=None).
+    Returns list of {"no_lanes": int, "hwynumb": str, "roadway_id": str|None} dicts.
 
-    Connector/ramp segments (HWYNAME contains "CONN") are excluded — they represent
-    interchange connectors, not mainline highway lanes.
+    Route-specific mode (hwynumb provided):
+        Queries layer 126 filtered by HWYNUMB, optionally also by ST_HWY_SFX.
+        Uses a wider radius (max of radius_m and 200m) to find the route even if
+        the bridge point is offset from the road centerline.
+        No CONN filter — the caller already targets a specific route/suffix, so
+        connector segments for that route are correct (e.g., a bridge carrying
+        connector DF should get connector-DF lane counts).
+        hwynumb must be the zero-stripped integer string (e.g., "64" not "064");
+        zero-padding to 3 digits is applied internally for the WHERE clause.
+        sfx is the ST_HWY_SFX value from HWY_AND_CON (e.g., "DF", "00").
 
-    Deduplication key is (lanes, hwynumb, roadway_id) so that directional carriageways
-    of a divided highway (same HWYNUMB, different RDWY_ID, different lane counts) are
-    kept as separate entries rather than collapsed into one.
+    Spatial-only mode (no hwynumb):
+        Falls back to a proximity query on layers 126 + 347.
+        Connector/ramp segments (HWYNAME contains "CONN") are excluded because
+        in the absence of route context a spatial query near an interchange may
+        pick up ramps that are not the carried feature.
+
+    Deduplication key is (lanes, hwynumb, roadway_id) so that directional
+    carriageways of a divided highway are kept as separate entries.
     """
     results = []
     seen    = set()
 
-    # Layer 126 — State highways; has HWYNUMB and RDWY_ID for route/direction matching
-    for feat in _query_layer(126, lat, lon, radius_m, "NO_LANES,HWYNUMB,RDWY_ID,HWYNAME"):
-        a = feat.get("attributes", {})
-        try:
-            lanes = int(a.get("NO_LANES") or 0)
-        except (ValueError, TypeError):
-            continue
-        if lanes <= 0:
-            continue
-        # Skip connector/ramp segments — not mainline highway lanes
-        hwyname = (a.get("HWYNAME") or "").upper()
-        if "CONN" in hwyname:
-            continue
-        hwy = (a.get("HWYNUMB") or "").strip().lstrip("0")
-        rid = a.get("RDWY_ID")  # string e.g. '1' or '2'; None if absent
-        key = (lanes, hwy, rid)
-        if key not in seen:
-            seen.add(key)
-            results.append({"no_lanes": lanes, "hwynumb": hwy, "roadway_id": rid})
+    if hwynumb:
+        # ── Route-specific mode ───────────────────────────────────────────────
+        hwynumb_padded = hwynumb.zfill(3)
+        where = f"HWYNUMB='{hwynumb_padded}'"
+        if sfx:
+            where += f" AND ST_HWY_SFX='{sfx.upper()}'"
+        effective_r = max(radius_m, 200)
+        for feat in _query_layer(126, lat, lon, effective_r,
+                                 "NO_LANES,HWYNUMB,RDWY_ID,HWYNAME", where=where):
+            a = feat.get("attributes", {})
+            try:
+                lanes = int(a.get("NO_LANES") or 0)
+            except (ValueError, TypeError):
+                continue
+            if lanes <= 0:
+                continue
+            hwy = (a.get("HWYNUMB") or "").strip().lstrip("0")
+            rid = a.get("RDWY_ID")
+            key = (lanes, hwy, rid)
+            if key not in seen:
+                seen.add(key)
+                results.append({"no_lanes": lanes, "hwynumb": hwy, "roadway_id": rid})
+    else:
+        # ── Spatial-only mode ─────────────────────────────────────────────────
+        for feat in _query_layer(126, lat, lon, radius_m, "NO_LANES,HWYNUMB,RDWY_ID,HWYNAME"):
+            a = feat.get("attributes", {})
+            try:
+                lanes = int(a.get("NO_LANES") or 0)
+            except (ValueError, TypeError):
+                continue
+            if lanes <= 0:
+                continue
+            hwyname = (a.get("HWYNAME") or "").upper()
+            if "CONN" in hwyname:
+                continue
+            hwy = (a.get("HWYNUMB") or "").strip().lstrip("0")
+            rid = a.get("RDWY_ID")
+            key = (lanes, hwy, rid)
+            if key not in seen:
+                seen.add(key)
+                results.append({"no_lanes": lanes, "hwynumb": hwy, "roadway_id": rid})
 
-    # Layer 347 — Non-state roads; no HWYNUMB or RDWY_ID
-    for feat in _query_layer(347, lat, lon, radius_m, "NO_LANES"):
-        a = feat.get("attributes", {})
-        try:
-            lanes = int(a.get("NO_LANES") or 0)
-        except (ValueError, TypeError):
-            continue
-        if lanes <= 0:
-            continue
-        key = (lanes, "", None)
-        if key not in seen:
-            seen.add(key)
-            results.append({"no_lanes": lanes, "hwynumb": "", "roadway_id": None})
+        # Layer 347 — Non-state roads (only in spatial-only mode)
+        for feat in _query_layer(347, lat, lon, radius_m, "NO_LANES"):
+            a = feat.get("attributes", {})
+            try:
+                lanes = int(a.get("NO_LANES") or 0)
+            except (ValueError, TypeError):
+                continue
+            if lanes <= 0:
+                continue
+            key = (lanes, "", None)
+            if key not in seen:
+                seen.add(key)
+                results.append({"no_lanes": lanes, "hwynumb": "", "roadway_id": None})
 
     return results
 
@@ -263,7 +296,71 @@ def f03_with_direction(base_name, direction):
     return "|".join(result)
 
 
-def build_f03_name(hwynumb, lat, lon, fallback_text, radius_m=300):
+_SKIP_ROAD_TYPES = {"FWY", "RAMP", "HWY", "EXPWY"}
+
+
+def _name_from_layer164(lat, lon, hint_text=None, radius_m=150):
+    """
+    Find a properly-formatted road name from ODOT layer 164 near (lat, lon).
+
+    Two-pass strategy:
+      Pass 1 — CONN entries whose alias road type is a common road type (not RAMP/HWY/FWY):
+               build "ALIAS_PREFIX ALIAS_NAME ALIAS_TYPE" → e.g. "SE Johnson Creek Blvd".
+      Pass 2 — non-CONN, non-FWY, non-RAMP entries whose name tokens overlap with hint_text
+               (if provided): build "PREFIX NAME TYPE" → e.g. "SE Johnson Creek Blvd".
+
+    Prefix-like tokens (SE, NE, SW, NW) are uppercased; other tokens are title-cased.
+    Returns "" if no suitable road is found.
+    """
+    feats = _query_layer(
+        164, lat, lon, radius_m,
+        "NAME,PREFIX,TYPE,ALIAS_NAME,ALIAS_PREFIX,ALIAS_TYPE",
+    )
+
+    _DIR_PREFIXES = {"NE", "NW", "SE", "SW", "N", "S", "E", "W"}
+
+    def _fmt(*parts):
+        tokens = " ".join(filter(None, parts)).split()
+        return " ".join(t.upper() if t.upper() in _DIR_PREFIXES else t.capitalize()
+                        for t in tokens)
+
+    # Pass 1: CONN entries with a useful alias road type
+    for feat in feats:
+        a = feat.get("attributes", {})
+        if (a.get("TYPE") or "").strip().upper() != "CONN":
+            continue
+        alias_type = (a.get("ALIAS_TYPE") or "").strip().upper()
+        if not alias_type or alias_type in _SKIP_ROAD_TYPES:
+            continue
+        alias_pfx  = (a.get("ALIAS_PREFIX") or "").strip()
+        alias_name = (a.get("ALIAS_NAME")   or "").strip()
+        if not alias_name:
+            continue
+        name = _fmt(alias_pfx, alias_name, alias_type)
+        if name:
+            return name
+
+    # Pass 2: non-CONN, non-FWY/RAMP entries (with optional hint matching)
+    hint_tokens = set((hint_text or "").lower().split()) - {"the", "of", "a", "an"}
+    for feat in feats:
+        a = feat.get("attributes", {})
+        ftype  = (a.get("TYPE")   or "").strip().upper()
+        prefix = (a.get("PREFIX") or "").strip()
+        name   = (a.get("NAME")   or "").strip()
+        if not name or ftype in _SKIP_ROAD_TYPES:
+            continue
+        if hint_tokens:
+            label_tokens = set((prefix + " " + name + " " + ftype).lower().split())
+            if not (hint_tokens & label_tokens):
+                continue
+        result = _fmt(prefix, name, ftype)
+        if result:
+            return result
+
+    return ""
+
+
+def build_f03_name(hwynumb, lat, lon, fallback_text, radius_m=300, sfx=None):
     """
     Build a proper SNBI B.F.03 base name for a highway feature.
 
@@ -274,10 +371,23 @@ def build_f03_name(hwynumb, lat, lon, fallback_text, radius_m=300):
 
     Returns pipe-delimited name with route numbers first (sorted I > US > OR > other),
     then common name, e.g. "I-205|East Portland Freeway".
-    Falls back to fallback_text if no HWYNUMB or no layer 166 data found.
+
+    Falls back to _name_from_layer164 (then fallback_text) when:
+      - hwynumb is None (local/connector road with no highway number in CARRIES)
+      - layer 166 returns no features
+      - sfx is provided and is not "00" (explicitly a connector/ramp suffix from HWY_AND_CON)
+      - all layer 166 results have non-"00" ST_HWY_SFX (detected as connector from context)
     """
     if not hwynumb:
-        return (fallback_text or "").strip()
+        # No highway number — try layer 164 for a properly-prefixed local/connector road name
+        road_164 = _name_from_layer164(lat, lon, hint_text=fallback_text)
+        return road_164 or (fallback_text or "").strip()
+
+    # If sfx is explicitly a connector/ramp suffix, skip layer 166 (which would return the
+    # parent highway route) and go directly to the layer 164 common name.
+    if sfx and sfx != "00":
+        road_164 = _name_from_layer164(lat, lon, hint_text=fallback_text)
+        return road_164 or (fallback_text or f"Hwy {hwynumb}").strip()
 
     hwynumb_padded = hwynumb.zfill(3)
     feats = _query_layer(
@@ -286,7 +396,20 @@ def build_f03_name(hwynumb, lat, lon, fallback_text, radius_m=300):
         where=f"HWYNUMB='{hwynumb_padded}'",
     )
     if not feats:
-        return (fallback_text or f"Hwy {hwynumb}").strip()
+        # Layer 166 returned nothing — try layer 164 before falling back to raw text
+        road_164 = _name_from_layer164(lat, lon, hint_text=fallback_text)
+        return road_164 or (fallback_text or f"Hwy {hwynumb}").strip()
+
+    # If every layer 166 result is a connector/ramp (no "00" mainline suffix), the HWYNUMB
+    # maps to a ramp/connector and the route designation would be the parent freeway name.
+    all_connector = all(
+        (f.get("attributes", {}).get("ST_HWY_SFX") or "").strip() != "00"
+        for f in feats
+    )
+    if all_connector:
+        road_164 = _name_from_layer164(lat, lon, hint_text=fallback_text)
+        if road_164:
+            return road_164
 
     route_desigs = []
     hwyname      = ""
@@ -297,8 +420,8 @@ def build_f03_name(hwynumb, lat, lon, fallback_text, radius_m=300):
         rte = (a.get("ALL_RTE") or "").strip()
         if rte and rte not in route_desigs:
             route_desigs.append(rte)
-        sfx = (a.get("ST_HWY_SFX") or "").strip()
-        if not hwyname and sfx == "00":
+        feat_sfx = (a.get("ST_HWY_SFX") or "").strip()
+        if not hwyname and feat_sfx == "00":
             hwyname = " ".join(w.capitalize() for w in
                                (a.get("HWYNAME") or "").strip().split())
         if not road_name:
@@ -617,19 +740,47 @@ def discover_features(lat, lon, feature_category=None):
 
 def get_bridge_carries_crosses(bridge_id):
     """
-    Query layer 101 for the CARRIES and CROSSES text fields of a specific bridge.
-    Returns (carries_str, crosses_str); empty strings on failure.
+    Query layer 101 for the CARRIES, CROSSES, and HWY_AND_CON fields of a specific bridge.
+    Returns (carries_str, crosses_str, hwy_and_con_str); empty strings on failure.
+
+    HWY_AND_CON encodes the carried highway and suffix (e.g. "064DF" = Hwy 064, connector DF;
+    "06400" = Hwy 064 mainline).  Use _parse_hwy_and_con() to split it.
     """
     feats = _query_by_attr(
         101,
         f"BRIDGE_ID='{bridge_id}'",
-        "BRIDGE_ID,CARRIES,CROSSES",
+        "BRIDGE_ID,CARRIES,CROSSES,HWY_AND_CON",
         return_geometry=False,
     )
     if not feats:
-        return "", ""
+        return "", "", ""
     a = feats[0].get("attributes", {})
-    return (a.get("CARRIES") or "").strip(), (a.get("CROSSES") or "").strip()
+    return (
+        (a.get("CARRIES")     or "").strip(),
+        (a.get("CROSSES")     or "").strip(),
+        (a.get("HWY_AND_CON") or "").strip(),
+    )
+
+
+def _parse_hwy_and_con(hwy_and_con):
+    """
+    Parse ODOT HWY_AND_CON field into (hwynumb, sfx).
+
+    Examples:
+        "064DF" → ("64", "DF")   connector DF of highway 64
+        "06400" → ("64", "00")   mainline of highway 64
+        "02600" → ("26", "00")
+
+    Returns ("", "") on empty or unparseable input.
+    """
+    if not hwy_and_con:
+        return "", ""
+    m = _re.match(r'^(\d{3})(.{0,2})\s*$', hwy_and_con.strip())
+    if not m:
+        return "", ""
+    num = m.group(1).lstrip("0") or "0"
+    sfx = (m.group(2) or "00").strip().upper() or "00"
+    return num, sfx
 
 
 def find_nearby_bridges(bridge_id, lat, lon, radius_m=200):
@@ -713,7 +864,12 @@ def gather_feature_context(bridge_id, lat, lon):
     and returns a structured dict for prompt construction. Falls back gracefully
     on any network error.
     """
-    carries, crosses = get_bridge_carries_crosses(bridge_id)
+    carries, crosses, hwy_and_con = get_bridge_carries_crosses(bridge_id)
+
+    # Parse HWY_AND_CON for route-specific lane count lookup and connector detection.
+    # hac_hwynumb/hac_sfx are the definitive highway number + suffix for the carried route
+    # (e.g. hwy_and_con="064DF" → hwynumb="64", sfx="DF" for connector bridges).
+    hac_hwynumb, hac_sfx = _parse_hwy_and_con(hwy_and_con)
 
     route_names = []
     for f in _query_layer(166, lat, lon, 100, "ALL_RTE"):
@@ -765,10 +921,12 @@ def gather_feature_context(bridge_id, lat, lon):
     carries_divided, carries_divided_reason = detect_divided(carries, median_features)
     crosses_divided, crosses_divided_reason = detect_divided(crosses, median_features)
 
-    # Pre-build B.F.03 base names using signed-route data (most recognizable name first)
-    carries_hwynumb = _hwy_num(carries)
-    crosses_hwynumb = _hwy_num(crosses)
-    carries_f03_base = build_f03_name(carries_hwynumb, lat, lon, carries)
+    # Pre-build B.F.03 base names using signed-route data (most recognizable name first).
+    # Pass hac_sfx so build_f03_name can skip layer 166 for connector routes (sfx != "00"),
+    # which would otherwise return the parent freeway designation instead of the connector name.
+    carries_hwynumb  = _hwy_num(carries) or hac_hwynumb
+    crosses_hwynumb  = _hwy_num(crosses)
+    carries_f03_base = build_f03_name(carries_hwynumb, lat, lon, carries, sfx=hac_sfx or None)
     crosses_f03_base = build_f03_name(crosses_hwynumb, lat, lon, crosses)
 
     sidewalk_sides = set()
@@ -794,8 +952,15 @@ def gather_feature_context(bridge_id, lat, lon):
 
     osm_features = _query_osm_all_features(lat, lon)
 
-    # Lane counts from ODOT road inventory (layers 126 + 347)
-    lane_counts = query_lane_counts(lat, lon, radius_m=75)
+    # Route-specific lane count query using HWY_AND_CON.
+    # When hac_hwynumb and hac_sfx are known, queries layer 126 filtered by HWYNUMB+ST_HWY_SFX
+    # so only the carried route's segments are returned (no ramp/connector contamination for
+    # mainline bridges; correct connector segments for connector-carrying bridges).
+    lane_counts = query_lane_counts(
+        lat, lon,
+        hwynumb=hac_hwynumb or None,
+        sfx=hac_sfx or None,
+    )
 
     return {
         "bridge_id":              bridge_id,
