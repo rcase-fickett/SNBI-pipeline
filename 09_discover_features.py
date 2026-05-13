@@ -126,25 +126,27 @@ def get_bf03_value(conn, bridge_id, feature_id):
 
 def fill_bh08(conn, bridge_id, feature_id, lanes, source, dry_run, force=False):
     """
-    Write B.H.08 brm_value. Returns True if written.
+    Write B.H.08 gis_value. Returns True if written.
 
-    Normally only fills null values. Pass force=True for GIS-split highways: when a
+    Writes to gis_value/gis_source — not brm_value — so GIS lane counts are kept
+    separate from original BrM/InfoBridge values.
+
+    Normally only fills null gis_value. Pass force=True for GIS-split highways: when a
     single BrM/InfoBridge feature has been divided into multiple directional carriageways
-    by GIS, the BrM total-lane count is wrong for each individual feature and must be
-    replaced with the per-carriageway GIS value.
+    by GIS, the stale gis_value must be replaced with the per-carriageway value.
     """
     row = conn.execute(
-        "SELECT id, brm_value FROM evidence "
+        "SELECT id, gis_value FROM evidence "
         "WHERE bridge_id=? AND item_id='B.H.08' AND feature_id=?",
         (bridge_id, feature_id)
     ).fetchone()
     if not row:
         return False
-    if not force and row["brm_value"]:
+    if not force and row["gis_value"]:
         return False
     if not dry_run:
         conn.execute(
-            "UPDATE evidence SET brm_value=?, brm_source_col=?, "
+            "UPDATE evidence SET gis_value=?, gis_source=?, "
             "updated_at=datetime('now') WHERE id=?",
             (str(lanes), source, row["id"])
         )
