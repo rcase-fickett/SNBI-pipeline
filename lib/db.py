@@ -243,11 +243,45 @@ def migrate_db(db_path):
         "ALTER TABLE bridges ADD COLUMN lat TEXT",
         "ALTER TABLE bridges ADD COLUMN lon TEXT",
         "ALTER TABLE evidence ADD COLUMN needs_field INTEGER DEFAULT 0",
+        "ALTER TABLE evidence ADD COLUMN gis_value TEXT",
+        "ALTER TABLE evidence ADD COLUMN gis_source TEXT",
     ]:
         try:
             conn.execute(sql)
         except Exception:
             pass  # column already exists
+    conn.commit()
+    # Migrate existing APPROX plan_values that came from GIS/automated sources
+    # (Phase 9 TransGIS names, Phase 10 USCG, old Phase 8 movable-bridge 999.9).
+    # Rows with long Claude-written reasoning (e.g. "NBI Item 116...") are left in plan_value.
+    conn.execute("""
+        UPDATE evidence
+           SET gis_value      = plan_value,
+               gis_source     = COALESCE(plan_reasoning, 'GIS pre-fill'),
+               plan_value     = NULL,
+               plan_confidence = 'PENDING',
+               plan_reasoning = NULL
+         WHERE plan_confidence = 'APPROX'
+           AND plan_value IS NOT NULL
+           AND gis_value IS NULL
+           AND (
+               plan_reasoning IS NULL
+               OR plan_reasoning LIKE '%USCG%'
+               OR plan_reasoning LIKE '%ODOT TransGIS%'
+               OR (plan_reasoning LIKE '%Movable%' AND plan_reasoning LIKE '%clearance%')
+           )
+    """)
+    # Migrate GIS-sourced B.RR.01 rows written to brm_value before the fill_rr01 column fix.
+    conn.execute("""
+        UPDATE evidence
+           SET gis_value      = brm_value,
+               gis_source     = brm_source_col,
+               brm_value      = NULL,
+               brm_source_col = NULL
+         WHERE item_id = 'B.RR.01'
+           AND brm_source_col LIKE '%TransGIS%'
+           AND gis_value IS NULL
+    """)
     conn.commit()
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS corrections (

@@ -84,10 +84,12 @@ def _classify_correction(plan_value, plan_confidence, user_det, status):
 
 def _compute_recommendation(row):
     """Synthesise a recommended value, source tag, and reasoning from AI + BrM data."""
-    conf = row.get('plan_confidence') or ''
-    plan = (row.get('plan_value')    or '').strip()
-    brm  = (row.get('brm_value')     or '').strip()
-    ai_r = (row.get('plan_reasoning')or '').strip()
+    conf    = row.get('plan_confidence') or ''
+    plan    = (row.get('plan_value')    or '').strip()
+    brm     = (row.get('brm_value')     or '').strip()
+    gis     = (row.get('gis_value')     or '').strip()
+    gis_src = (row.get('gis_source')    or '').strip()
+    ai_r    = (row.get('plan_reasoning')or '').strip()
 
     if conf == 'NA':
         return 'N/A', 'na', ai_r or 'Item is not applicable per SNBI spec.'
@@ -96,6 +98,8 @@ def _compute_recommendation(row):
     if plan and conf in ('HIGH', 'APPROX'):
         src = 'plan-high' if conf == 'HIGH' else 'plan-approx'
         return plan, src, ai_r
+    if gis:
+        return gis, 'gis', gis_src or 'GIS pre-fill.'
     if brm:
         if conf == 'PENDING' and not plan:
             reason = (f"No value found in plan drawings; AI extraction returned no result. "

@@ -16,6 +16,7 @@
       {% if show_feature %}<th style="width:62px">Feature</th>{% endif %}
       <th style="min-width:110px">Name</th>
       <th style="min-width:70px">BrM</th>
+      <th style="min-width:70px">GIS</th>
       <th style="min-width:80px">Plan Value</th>
       <th style="width:68px">Conf</th>
       <th style="min-width:120px">AI Recommendation</th>
@@ -67,7 +68,8 @@
         <td><span style="font-size:11px;color:#64748b">{{ row.feature_id }}</span></td>
         {% endif %}
         <td style="font-size:12px">{{ row.item_name or '' }}</td>
-        <td><span class="mono" style="font-size:12px;color:#94a3b8">{{ row.brm_value or '—' }}</span></td>
+        <td title="{{ row.brm_source_col or '' }}"><span class="mono" style="font-size:12px;color:#94a3b8">{{ row.brm_value or '—' }}</span></td>
+        <td><span class="mono" style="font-size:12px;color:#0891b2">{{ row.gis_value or '—' }}</span></td>
         <td><span class="mono" style="font-size:12px;color:#64748b">{{ row.plan_value or '—' }}</span></td>
         <td><span class="badge badge-{{ row.plan_confidence }}">
           {%- if row.plan_confidence == 'NOT_FOUND' -%}—{%- else -%}{{ row.plan_confidence }}{%- endif -%}
@@ -80,6 +82,7 @@
           <span class="rec-tag rec-{{ row.rec_source }}">
             {%- if row.rec_source == 'plan-high' %}Plan
             {%- elif row.rec_source == 'plan-approx' %}~Plan
+            {%- elif row.rec_source == 'gis' %}GIS
             {%- elif row.rec_source == 'brm' %}BrM
             {%- elif row.rec_source == 'field' %}Field
             {%- elif row.rec_source == 'na' %}N/A

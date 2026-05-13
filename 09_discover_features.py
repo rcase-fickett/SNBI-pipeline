@@ -81,18 +81,18 @@ def enrich_f03(conn, bridge_id, feature_id, gis_name, source, dry_run):
 
 
 def fill_rr01(conn, bridge_id, feature_id, service_type, dry_run):
-    """Write B.RR.01 brm_value if null. Returns 'inserted', 'updated', or None."""
+    """Write B.RR.01 gis_value if null. Returns 'inserted', 'updated', or None."""
     row = conn.execute(
-        "SELECT id, brm_value FROM evidence "
+        "SELECT id, gis_value FROM evidence "
         "WHERE bridge_id=? AND item_id='B.RR.01' AND feature_id=?",
         (bridge_id, feature_id)
     ).fetchone()
     if row:
-        if row["brm_value"]:
+        if row["gis_value"]:
             return None
         if not dry_run:
             conn.execute(
-                "UPDATE evidence SET brm_value=?, brm_source_col=?, "
+                "UPDATE evidence SET gis_value=?, gis_source=?, "
                 "updated_at=datetime('now') WHERE id=?",
                 (service_type, GIS_SOURCE, row["id"])
             )
@@ -102,8 +102,8 @@ def fill_rr01(conn, bridge_id, feature_id, service_type, dry_run):
             item = ITEM_BY_ID.get("B.RR.01", {})
             conn.execute(
                 "INSERT OR IGNORE INTO evidence "
-                "(bridge_id, item_id, feature_id, item_name, brm_value, "
-                "brm_source_col, plan_confidence, status) "
+                "(bridge_id, item_id, feature_id, item_name, gis_value, "
+                "gis_source, plan_confidence, status) "
                 "VALUES (?,?,?,?,?,?,'APPROX','PENDING')",
                 (bridge_id, "B.RR.01", feature_id,
                  item.get("name", "Railroad Service Type"),
